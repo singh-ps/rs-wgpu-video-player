@@ -1,3 +1,4 @@
+use crate::renderer::Renderer;
 use std::error::Error;
 use winit::{
     dpi::LogicalSize,
@@ -14,11 +15,13 @@ impl App {
         let event_loop = EventLoop::new()?;
         event_loop.set_control_flow(ControlFlow::Poll);
 
-        let _window = WindowBuilder::new()
+        let window = WindowBuilder::new()
             .with_title("WGPU Video Player")
             .with_inner_size(LogicalSize::new(1270, 720))
             .with_resizable(false)
             .build(&event_loop)?;
+
+        let mut renderer = Renderer::new(&window).await?;
 
         event_loop.run(|event, elwt| match event {
             Event::WindowEvent { event, .. } => match event {
@@ -31,8 +34,15 @@ impl App {
                         },
                     ..
                 } => elwt.exit(),
+                WindowEvent::RedrawRequested => {
+                    let _ = renderer.render();
+                    window.request_redraw();
+                }
                 _ => {}
             },
+            Event::AboutToWait => {
+                window.request_redraw();
+            }
             _ => {}
         })?;
         Ok(())
