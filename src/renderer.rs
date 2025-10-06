@@ -54,7 +54,7 @@ impl<'r> Renderer<'r> {
             format: surface_format,
             width: size.width,
             height: size.height,
-            present_mode: PresentMode::Mailbox,
+            present_mode: PresentMode::Immediate,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
         };
