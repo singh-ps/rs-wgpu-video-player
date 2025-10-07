@@ -1,10 +1,13 @@
 use std::{
     error::Error,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
-use tokio::task::JoinHandle;
 
 mod decoder;
+use decoder::loop_decoder;
 
 mod frame_buffer;
 use frame_buffer::FrameBuffer;
@@ -28,8 +31,7 @@ pub struct PlaybackParams {
 pub struct VideoPlayer {
     frame_buffer: FrameBuffer,
     is_initialized: bool,
-    decoder_handle: Option<JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>>,
-    shutdown: AtomicBool,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl VideoPlayer {
@@ -37,8 +39,7 @@ impl VideoPlayer {
         Self {
             frame_buffer: FrameBuffer::new(),
             is_initialized: false,
-            decoder_handle: None,
-            shutdown: AtomicBool::new(false),
+            shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -51,6 +52,14 @@ impl VideoPlayer {
             return Err("VideoPlayer is already initialized".into());
         }
 
+        let shutdown_clone = self.shutdown.clone();
+
+        tokio::task::spawn_blocking({
+            let url = url.to_string();
+            let buffer = self.frame_buffer.clone();
+            move || loop_decoder(url, params, buffer, shutdown_clone)
+        });
+
         Ok(())
     }
 
@@ -60,9 +69,6 @@ impl VideoPlayer {
         }
 
         self.shutdown.store(true, Ordering::Relaxed);
-
-        // deal with the decoder handle
-
         self.is_initialized = false;
     }
 }

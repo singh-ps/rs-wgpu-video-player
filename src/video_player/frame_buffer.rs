@@ -8,6 +8,7 @@ pub struct Frame {
     pub ts_us: u64,
 }
 
+#[derive(Clone)]
 pub struct FrameBuffer {
     tx: Sender<Option<Arc<Frame>>>,
     rx: Receiver<Option<Arc<Frame>>>,

@@ -3,8 +3,11 @@ use crate::video_player::{
     PixelFormat, PlaybackParams,
 };
 use ffmpeg::{
-    codec::context::Context, format, media::Type, software::scaling::Context as Scaler,
-    util::format::Pixel,
+    codec::context::Context,
+    format,
+    media::Type,
+    software::scaling::{Context as Scaler, Flags},
+    util::{format::Pixel, frame::Video},
 };
 use ffmpeg_next as ffmpeg;
 use std::{
@@ -50,11 +53,11 @@ pub fn loop_decoder(
         out_pix,
         out_w,
         out_h,
-        ffmpeg::software::scaling::Flags::BILINEAR,
+        Flags::BILINEAR,
     )?;
 
-    let mut yuv = ffmpeg::util::frame::Video::empty();
-    let mut out = ffmpeg::util::frame::Video::empty();
+    let mut yuv = Video::empty();
+    let mut out = Video::empty();
 
     // PTS conversion + pacing info
     let tb = vstream.time_base();
@@ -84,50 +87,48 @@ pub fn loop_decoder(
             continue;
         }
 
-        if dec.send_packet(&packet).is_ok() {
-            loop {
-                match dec.receive_frame(&mut yuv) {
-                    Ok(()) => {
-                        if shutdown.load(Ordering::Relaxed) {
-                            buffer.finish();
-                            return Ok(());
-                        }
+        if let Err(e) = dec.send_packet(&packet) {
+            eprintln!("decoder send_packet error: {e}");
+            std::thread::sleep(Duration::from_millis(2));
+            continue;
+        }
 
-                        if let Err(e) = scaler.run(&yuv, &mut out) {
-                            eprintln!("Scaling error: {e}");
-                            continue;
-                        }
+        while let Ok(()) = dec.send_packet(&packet) {
+            if shutdown.load(Ordering::Relaxed) {
+                buffer.finish();
+                return Ok(());
+            }
 
-                        // Copy scaler output plane (producer-side allocation per frame).
-                        let plane = out.data(0);
-                        let pixels: Arc<[u8]> = Vec::from(plane).into();
+            if let Err(e) = scaler.run(&yuv, &mut out) {
+                eprintln!("Scaling error: {e}");
+                continue;
+            }
 
-                        let ts_us =
-                            pts_to_us(yuv.timestamp().unwrap_or(0), tb.0 as u32, tb.1 as u32)
-                                .unwrap_or(0);
+            // Copy scaler output plane (producer-side allocation per frame).
+            let plane = out.data(0);
+            let pixels: Arc<[u8]> = Vec::from(plane).into();
 
-                        let frame = Arc::new(Frame {
-                            data: pixels,
-                            width: out_w as u32,
-                            height: out_h as u32,
-                            ts_us: ts_us as u64,
-                        });
+            let ts_us =
+                pts_to_us(yuv.timestamp().unwrap_or(0), tb.0 as u32, tb.1 as u32).unwrap_or(0);
 
-                        buffer.push(frame);
+            let frame = Arc::new(Frame {
+                data: pixels,
+                width: out_w as u32,
+                height: out_h as u32,
+                ts_us: ts_us as u64,
+            });
 
-                        if frame_dt.as_millis() > 0 {
-                            let elapsed = last_tick.elapsed();
-                            if elapsed < frame_dt {
-                                let sleep = frame_dt - elapsed;
-                                std::thread::sleep(sleep.max(Duration::from_millis(1)));
-                            } else {
-                                std::thread::sleep(Duration::from_millis(1));
-                            }
-                            last_tick = Instant::now();
-                        }
-                    }
-                    Err(_) => break, // EAGAIN/EOF for this packet
-                }
+            buffer.push(frame);
+
+            if frame_dt.as_millis() > 0 {
+                let elapsed = last_tick.elapsed();
+                let sleep = if elapsed < frame_dt {
+                    frame_dt - elapsed
+                } else {
+                    Duration::from_millis(1)
+                };
+                std::thread::sleep(sleep);
+                last_tick = Instant::now();
             }
         }
     }
