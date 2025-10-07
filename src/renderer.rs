@@ -70,12 +70,6 @@ impl<'r> Renderer<'r> {
             .find(|f| f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
 
-        let present_mode = if surface_caps.present_modes.contains(&PresentMode::Mailbox) {
-            PresentMode::Mailbox
-        } else {
-            PresentMode::Fifo
-        };
-
         let size = window.inner_size();
         let config = SurfaceConfiguration {
             desired_maximum_frame_latency: 1,
@@ -83,7 +77,7 @@ impl<'r> Renderer<'r> {
             format: surface_format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode,
+            present_mode: PresentMode::Fifo,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
         };
@@ -212,7 +206,7 @@ impl<'r> Renderer<'r> {
         };
 
         if recreate {
-            let tex = Self::create_texture(&self, width, height);
+            let tex = Self::create_texture(self, width, height);
 
             let view = tex.create_view(&TextureViewDescriptor::default());
             let bind = self.device.create_bind_group(&BindGroupDescriptor {
