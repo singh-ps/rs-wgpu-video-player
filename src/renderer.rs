@@ -30,6 +30,10 @@ pub struct Renderer<'r> {
     pipeline: RenderPipeline,
     bind_layout: BindGroupLayout,
     frame_tex: Option<FrameTexture>,
+    surf_w: u32,
+    surf_h: u32,
+    vid_w: u32,
+    vid_h: u32,
 }
 
 impl<'r> Renderer<'r> {
@@ -70,16 +74,16 @@ impl<'r> Renderer<'r> {
         let present_mode = if surface_caps.present_modes.contains(&PresentMode::Mailbox) {
             PresentMode::Mailbox
         } else {
-            PresentMode::Immediate
+            PresentMode::Fifo
         };
 
         let size = window.inner_size();
         let config = SurfaceConfiguration {
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: 1,
             usage: TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
-            width: size.width,
-            height: size.height,
+            width: size.width.max(1),
+            height: size.height.max(1),
             present_mode,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
@@ -162,7 +166,16 @@ impl<'r> Renderer<'r> {
             pipeline,
             bind_layout,
             frame_tex: None,
+            surf_w: size.width.max(1),
+            surf_h: size.height.max(1),
+            vid_w: 0,
+            vid_h: 0,
         })
+    }
+
+    pub fn set_video_size(&mut self, width: u32, height: u32) {
+        self.vid_w = width;
+        self.vid_h = height;
     }
 
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
@@ -170,7 +183,27 @@ impl<'r> Renderer<'r> {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
+            self.surf_w = new_size.width;
+            self.surf_h = new_size.height;
         }
+    }
+
+    #[inline]
+    fn create_texture(&self, width: u32, height: u32) -> Texture {
+        self.device.create_texture(&TextureDescriptor {
+            label: Some("Frame Texture"),
+            size: Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8UnormSrgb,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        })
     }
 
     pub fn set_frame_data(&mut self, width: u32, height: u32, data: &[u8]) {
@@ -180,20 +213,7 @@ impl<'r> Renderer<'r> {
         };
 
         if needs_new_tex {
-            let tex = self.device.create_texture(&TextureDescriptor {
-                label: Some("Frame Texture"),
-                size: Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: TextureDimension::D2,
-                format: TextureFormat::Rgba8UnormSrgb,
-                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
+            let tex = Self::create_texture(&self, width, height);
 
             let view = tex.create_view(&TextureViewDescriptor::default());
             let bind = self.device.create_bind_group(&BindGroupDescriptor {
@@ -257,6 +277,7 @@ impl<'r> Renderer<'r> {
         };
 
         let mut command_encoder = self.device.create_command_encoder(&command_encoder_desc);
+        let (vp_x, vp_y, vp_w, vp_h) = self.compute_letterbox_rect();
         {
             let rp_color_attachment = RenderPassColorAttachment {
                 depth_slice: None,
@@ -284,6 +305,15 @@ impl<'r> Renderer<'r> {
 
             if let Some(v) = &self.frame_tex {
                 render_pass.set_pipeline(&self.pipeline);
+                render_pass.set_viewport(
+                    vp_x as f32,
+                    vp_y as f32,
+                    vp_w as f32,
+                    vp_h as f32,
+                    0.0,
+                    1.0,
+                );
+                render_pass.set_scissor_rect(vp_x, vp_y, vp_w, vp_h);
                 render_pass.set_bind_group(0, &v.bind, &[]);
                 render_pass.draw(0..3, 0..1);
             }
@@ -293,5 +323,32 @@ impl<'r> Renderer<'r> {
         frame.present();
 
         Ok(())
+    }
+
+    fn compute_letterbox_rect(&self) -> (u32, u32, u32, u32) {
+        // If we don’t yet know video size, fill the surface
+        if self.vid_w == 0 || self.vid_h == 0 {
+            return (0, 0, self.surf_w, self.surf_h);
+        }
+
+        let sw = self.surf_w as f32;
+        let sh = self.surf_h as f32;
+        let vw = self.vid_w as f32;
+        let vh = self.vid_h as f32;
+
+        let surf_ar = sw / sh;
+        let video_ar = vw / vh;
+
+        if surf_ar > video_ar {
+            // surface wider → pillarbox left/right
+            let disp_w = (sh * video_ar).round().max(1.0);
+            let pad_x = ((sw - disp_w) * 0.5).round().max(0.0);
+            (pad_x as u32, 0, disp_w as u32, self.surf_h)
+        } else {
+            // surface taller → letterbox top/bottom
+            let disp_h = (sw / video_ar).round().max(1.0);
+            let pad_y = ((sh - disp_h) * 0.5).round().max(0.0);
+            (0, pad_y as u32, self.surf_w, disp_h as u32)
+        }
     }
 }

@@ -77,7 +77,7 @@ pub fn loop_decoder(
             return Ok(());
         }
 
-        // Tiny cooperative yield
+        // tiny cooperative yield to avoid hogging
         pkt_ctr += 1;
         if pkt_ctr % 5 == 0 {
             std::thread::sleep(Duration::from_millis(1));
@@ -87,13 +87,15 @@ pub fn loop_decoder(
             continue;
         }
 
+        // Be a bit resilient to transient send errors
         if let Err(e) = dec.send_packet(&packet) {
             eprintln!("decoder send_packet error: {e}");
             std::thread::sleep(Duration::from_millis(2));
             continue;
         }
 
-        while let Ok(()) = dec.send_packet(&packet) {
+        // Drain frames produced by this packet
+        while let Ok(()) = dec.receive_frame(&mut yuv) {
             if shutdown.load(Ordering::Relaxed) {
                 buffer.finish();
                 return Ok(());
@@ -104,7 +106,7 @@ pub fn loop_decoder(
                 continue;
             }
 
-            // Copy scaler output plane (producer-side allocation per frame).
+            // Producer-side copy → Arc<[u8]>; readers are zero-copy
             let plane = out.data(0);
             let pixels: Arc<[u8]> = Vec::from(plane).into();
 
@@ -120,6 +122,7 @@ pub fn loop_decoder(
 
             buffer.push(frame);
 
+            // Pacing (only for VOD tests)
             if frame_dt.as_millis() > 0 {
                 let elapsed = last_tick.elapsed();
                 let sleep = if elapsed < frame_dt {
@@ -152,6 +155,17 @@ pub fn loop_decoder(
                 ts_us: ts_us as u64,
             });
             buffer.push(frame);
+
+            if frame_dt.as_millis() > 0 {
+                let elapsed = last_tick.elapsed();
+                let sleep = if elapsed < frame_dt {
+                    frame_dt - elapsed
+                } else {
+                    Duration::from_millis(1)
+                };
+                std::thread::sleep(sleep);
+                last_tick = Instant::now();
+            }
         }
     }
 
