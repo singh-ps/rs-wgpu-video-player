@@ -18,7 +18,7 @@ pub use probe::get_video_info;
 #[derive(Default)]
 pub enum PixelFormat {
     #[default]
-    RGB8,
+    RGBA,
     RGB24,
 }
 

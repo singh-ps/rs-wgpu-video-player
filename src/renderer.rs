@@ -9,13 +9,12 @@ use wgpu::{
     SamplerBindingType, SamplerDescriptor, ShaderModuleDescriptor, ShaderStages, StoreOp, Surface,
     SurfaceConfiguration, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect,
     TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
-    TextureView, TextureViewDescriptor, TextureViewDimension, VertexState,
+    TextureViewDescriptor, TextureViewDimension, VertexState,
 };
 use winit::{dpi::PhysicalSize, window::Window};
 
 struct FrameTexture {
     texture: Texture,
-    view: TextureView,
     bind: BindGroup,
     width: u32,
     height: u32,
@@ -207,12 +206,12 @@ impl<'r> Renderer<'r> {
     }
 
     pub fn set_frame_data(&mut self, width: u32, height: u32, data: &[u8]) {
-        let needs_new_tex = match &self.frame_tex {
+        let recreate = match &self.frame_tex {
             Some(tex) => tex.width != width || tex.height != height,
             None => true,
         };
 
-        if needs_new_tex {
+        if recreate {
             let tex = Self::create_texture(&self, width, height);
 
             let view = tex.create_view(&TextureViewDescriptor::default());
@@ -233,33 +232,32 @@ impl<'r> Renderer<'r> {
 
             self.frame_tex = Some(FrameTexture {
                 texture: tex,
-                view,
                 bind,
                 width,
                 height,
             });
+        }
 
-            if let Some(frame_tex) = &self.frame_tex {
-                self.queue.write_texture(
-                    TexelCopyTextureInfo {
-                        texture: &frame_tex.texture,
-                        mip_level: 0,
-                        origin: Origin3d::ZERO,
-                        aspect: TextureAspect::All,
-                    },
-                    data,
-                    TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(4 * width),
-                        rows_per_image: Some(height),
-                    },
-                    Extent3d {
-                        width,
-                        height,
-                        depth_or_array_layers: 1,
-                    },
-                );
-            }
+        if let Some(frame_tex) = &self.frame_tex {
+            self.queue.write_texture(
+                TexelCopyTextureInfo {
+                    texture: &frame_tex.texture,
+                    mip_level: 0,
+                    origin: Origin3d::ZERO,
+                    aspect: TextureAspect::All,
+                },
+                data,
+                TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * width),
+                    rows_per_image: Some(height),
+                },
+                Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
         }
     }
 

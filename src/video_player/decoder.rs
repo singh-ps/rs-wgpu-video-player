@@ -42,7 +42,7 @@ pub fn loop_decoder(
 
     let out_pix = match params.pixel_format {
         PixelFormat::RGB24 => Pixel::RGB24,
-        PixelFormat::RGB8 => Pixel::RGB8,
+        PixelFormat::RGBA => Pixel::RGBA,
     };
 
     // Build scaler.
