@@ -14,7 +14,7 @@ fn vs_main(@builtin(vertex_index) vidx : u32) -> VsOut {
   let p = pos[vidx];
   var out : VsOut;
   out.pos = vec4<f32>(p, 0.0, 1.0);
-  out.uv = 0.5 * (p + vec2<f32>(1.0, 1.0));
+  out.uv = 0.5 * vec2<f32>(p.x + 1, 1 - p.y);
   return out;
 }
 
