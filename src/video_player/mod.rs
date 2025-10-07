@@ -10,7 +10,7 @@ mod decoder;
 use decoder::loop_decoder;
 
 mod frame_buffer;
-use frame_buffer::FrameBuffer;
+use frame_buffer::{Frame, FrameBuffer};
 
 mod probe;
 pub use probe::get_video_info;
@@ -47,7 +47,7 @@ impl VideoPlayer {
         &mut self,
         url: &str,
         params: PlaybackParams,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(), Box<dyn Error>> {
         if self.is_initialized {
             return Err("VideoPlayer is already initialized".into());
         }
@@ -70,6 +70,10 @@ impl VideoPlayer {
 
         self.shutdown.store(true, Ordering::Relaxed);
         self.is_initialized = false;
+    }
+
+    pub fn get_latest_frame(&mut self) -> Option<Arc<Frame>> {
+        self.frame_buffer.consume()
     }
 }
 
