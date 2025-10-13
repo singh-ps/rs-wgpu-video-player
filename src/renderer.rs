@@ -7,9 +7,9 @@ use wgpu::{
     PipelineLayoutDescriptor, PresentMode, PrimitiveState, Queue, RenderPassColorAttachment,
     RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, RequestAdapterOptions, Sampler,
     SamplerBindingType, SamplerDescriptor, ShaderModuleDescriptor, ShaderStages, StoreOp, Surface,
-    SurfaceConfiguration, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect,
-    TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
-    TextureViewDescriptor, TextureViewDimension, VertexState,
+    SurfaceConfiguration, SurfaceError, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture,
+    TextureAspect, TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType,
+    TextureUsages, TextureViewDescriptor, TextureViewDimension, VertexState,
 };
 use winit::{dpi::PhysicalSize, window::Window};
 
@@ -256,10 +256,20 @@ impl<'r> Renderer<'r> {
     }
 
     pub fn render(&mut self) -> Result<(), Box<dyn Error>> {
-        let frame = self
-            .surface
-            .get_current_texture()
-            .expect("Failed to acquire next swap chain texture");
+        let frame = match self.surface.get_current_texture() {
+            Ok(frame) => frame,
+            Err(SurfaceError::Lost) => {
+                self.resize(PhysicalSize::new(self.surf_w, self.surf_h));
+                return Ok(());
+            }
+            Err(SurfaceError::OutOfMemory) => {
+                return Err("Out of memory".into());
+            }
+            Err(e) => {
+                eprintln!("Surface error: {e}");
+                return Ok(());
+            }
+        };
 
         let texture_desc = TextureViewDescriptor::default();
         let frame_view = frame.texture.create_view(&texture_desc);

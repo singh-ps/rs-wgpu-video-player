@@ -53,6 +53,7 @@ impl VideoPlayer {
         }
 
         let shutdown_clone = self.shutdown.clone();
+        self.is_initialized = true;
 
         tokio::task::spawn_blocking({
             let url = url.to_string();
