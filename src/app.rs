@@ -14,11 +14,11 @@ use winit::{
 pub struct App {}
 
 impl App {
-    pub async fn run(&self) -> Result<(), Box<dyn Error>> {
+    pub async fn run(&self, url: String) -> Result<(), Box<dyn Error>> {
         let mut video_player = VideoPlayer::new();
         video_player
             .start_playback(
-                "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
+                &url,
                 Default::default(),
             )
             .await?;
