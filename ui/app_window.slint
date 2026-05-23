@@ -63,7 +63,7 @@ component PlaybackSlider inherits Rectangle {
             background: @linear-gradient(90deg, #00ffcc 0%, #0099ff 100%);
             border-radius: 3px;
         }
-        
+
         // The thumb
         Rectangle {
             x: (root.value * parent.width - self.width / 2).clamp(0px, parent.width - self.width);
@@ -75,6 +75,30 @@ component PlaybackSlider inherits Rectangle {
             border-width: 2px;
             border-color: #00ffcc;
             visible: touch.has-hover;
+        }
+    }
+}
+
+// Display-only progress bar. No seeking — playback engine has no seek path.
+component ProgressBar inherits Rectangle {
+    in property <float> value: 0.0; // 0.0 to 1.0
+
+    height: 16px;
+    background: transparent;
+
+    Rectangle {
+        y: (root.height - self.height) / 2;
+        height: 6px;
+        width: 100%;
+        background: #27272a;
+        border-radius: 3px;
+
+        Rectangle {
+            x: 0px;
+            height: 100%;
+            width: root.value * parent.width;
+            background: @linear-gradient(90deg, #00ffcc 0%, #0099ff 100%);
+            border-radius: 3px;
         }
     }
 }
@@ -97,7 +121,6 @@ export component AppWindow inherits Window {
     callback play-pause-clicked();
     callback stop-clicked();
     callback load-url-clicked(string);
-    callback seek-progress(float);
     callback volume-changed(float);
 
     VerticalLayout {
@@ -198,13 +221,9 @@ export component AppWindow inherits Window {
                         clicked => { root.stop-clicked(); }
                     }
 
-                    // Custom Slider Timeline
-                    progress-slider := PlaybackSlider {
+                    // Read-only progress bar
+                    ProgressBar {
                         value: root.timeline-progress;
-                        seek(val) => {
-                            root.timeline-progress = val;
-                            root.seek-progress(val);
-                        }
                     }
 
                     // Timestamp Display
@@ -220,17 +239,18 @@ export component AppWindow inherits Window {
                     // Volume icon + slider
                     HorizontalLayout {
                         spacing: 6px;
-                        alignment: center;
-                        width: 140px;
+                        width: 160px;
 
                         Text {
                             text: root.volume-level <= 0.0 ? "🔇" : root.volume-level < 0.5 ? "🔉" : "🔊";
                             font-size: 16px;
                             vertical-alignment: center;
+                            width: 24px;
                         }
 
                         volume-slider := PlaybackSlider {
                             value: root.volume-level;
+                            min-width: 120px;
                             seek(val) => {
                                 root.volume-level = val;
                                 root.volume-changed(val);

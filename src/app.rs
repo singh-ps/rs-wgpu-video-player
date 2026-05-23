@@ -206,20 +206,6 @@ impl App {
             start_playback_clone(stream_url.to_string());
         });
 
-        // Seek Callback (Visual Scrubbing Feedback)
-        let duration_secs_clone = duration_secs.clone();
-        let app_weak = app.as_weak();
-        app.on_seek_progress(move |percentage| {
-            let total = *lock(&duration_secs_clone);
-            if total > 0.0 {
-                let target_secs = total * percentage as f64;
-                if let Some(ui) = app_weak.upgrade() {
-                    ui.set_elapsed_time(format_time(target_secs).into());
-                    ui.set_status_text(format!("Scrubbing: {}", format_time(target_secs)).into());
-                }
-            }
-        });
-
         // Volume Callback — immediately update the atomic read by cpal
         let player_clone = player.clone();
         app.on_volume_changed(move |val| {
