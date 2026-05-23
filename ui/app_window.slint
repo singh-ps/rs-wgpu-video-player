@@ -1,0 +1,264 @@
+import { LineEdit } from "std-widgets.slint";
+
+component PlayerButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary: false;
+    callback clicked();
+
+    background: touch.pressed ? (primary ? #00b38f : #27272a) : (touch.has-hover ? (primary ? #33ffdd : #202024) : (primary ? #00ffcc : #141416));
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: primary ? transparent : #3f3f4644;
+    height: 36px;
+    
+    animate background { duration: 120ms; easing: ease-out; }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        alignment: center;
+        Text {
+            text: root.text;
+            color: primary ? #0a0a0c : #f4f4f5;
+            font-weight: 700;
+            font-size: 13px;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component PlaybackSlider inherits Rectangle {
+    in-out property <float> value: 0.0; // 0.0 to 1.0
+    callback seek(float);
+
+    height: 16px;
+    background: transparent;
+
+    touch := TouchArea {
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.left && (event.kind == PointerEventKind.down || event.kind == PointerEventKind.move)) {
+                root.value = (self.mouse-x / root.width).clamp(0.0, 1.0);
+                root.seek(root.value);
+            }
+        }
+    }
+
+    // The track background
+    Rectangle {
+        y: (root.height - self.height) / 2;
+        height: 6px;
+        width: 100%;
+        background: #27272a;
+        border-radius: 3px;
+
+        // The filled progress
+        Rectangle {
+            x: 0px;
+            height: 100%;
+            width: root.value * parent.width;
+            background: @linear-gradient(90deg, #00ffcc 0%, #0099ff 100%);
+            border-radius: 3px;
+        }
+
+        // The thumb
+        Rectangle {
+            x: (root.value * parent.width - self.width / 2).clamp(0px, parent.width - self.width);
+            y: (parent.height - self.height) / 2;
+            height: 12px;
+            width: 12px;
+            border-radius: 6px;
+            background: #ffffff;
+            border-width: 2px;
+            border-color: #00ffcc;
+            visible: touch.has-hover;
+        }
+    }
+}
+
+// Display-only progress bar. No seeking — playback engine has no seek path.
+component ProgressBar inherits Rectangle {
+    in property <float> value: 0.0; // 0.0 to 1.0
+
+    height: 16px;
+    background: transparent;
+
+    Rectangle {
+        y: (root.height - self.height) / 2;
+        height: 6px;
+        width: 100%;
+        background: #27272a;
+        border-radius: 3px;
+
+        Rectangle {
+            x: 0px;
+            height: 100%;
+            width: root.value * parent.width;
+            background: @linear-gradient(90deg, #00ffcc 0%, #0099ff 100%);
+            border-radius: 3px;
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "Video Player";
+    width: 1280px;
+    height: 800px;
+    background: #0b0b0d;
+
+    in-out property <image> video-frame;
+    in property <string> elapsed-time: "00:00";
+    in property <string> total-duration: "--:--";
+    in property <string> status-text: "Stopped";
+    in property <bool> is-playing: false;
+    in-out property <string> current-url: "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8";
+    in-out property <float> timeline-progress: 0.0; // 0.0 to 1.0
+    in-out property <float> volume-level: 1.0; // 0.0 to 1.0
+
+    callback play-pause-clicked();
+    callback stop-clicked();
+    callback load-url-clicked(string);
+    callback volume-changed(float);
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 16px;
+
+        // Video Player Display Area (with aspect ratio lock)
+        Rectangle {
+            background: #040405;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: #1f1f23;
+            clip: true;
+            
+            // The video output
+            Image {
+                width: 100%;
+                height: 100%;
+                source: root.video-frame;
+                image-fit: contain; // Automatic letterboxing/pillarboxing!
+            }
+
+            // Glassmorphic status label in top left
+            Rectangle {
+                x: 16px;
+                y: 16px;
+                background: #121215bb;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: #27272aaa;
+                height: 28px;
+                width: 100px;
+
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    alignment: center;
+                    Text {
+                        text: root.status-text;
+                        color: root.is-playing ? #00ffcc : #a1a1aa;
+                        font-weight: 800;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // Control Area & URL Bar (translucent dark panel)
+        Rectangle {
+            background: #121215dd;
+            border-radius: 16px;
+            border-width: 1px;
+            border-color: #27272acc;
+            height: 110px;
+
+            VerticalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                padding-top: 12px;
+                padding-bottom: 12px;
+                spacing: 12px;
+
+                // Stream URL Loading bar
+                HorizontalLayout {
+                    spacing: 12px;
+                    
+                    url-input := LineEdit {
+                        text: root.current-url;
+                        placeholder-text: "Enter video stream URL (.m3u8, .mp4)...";
+                        font-size: 14px;
+                    }
+                    
+                    PlayerButton {
+                        text: "Load Stream";
+                        primary: true;
+                        clicked => {
+                            root.current-url = url-input.text;
+                            root.load-url-clicked(url-input.text);
+                        }
+                    }
+                }
+
+                // Controls row
+                HorizontalLayout {
+                    spacing: 16px;
+
+                    // Play/Pause Button
+                    PlayerButton {
+                        text: root.is-playing ? "  Pause  " : "  Play  ";
+                        primary: !root.is-playing;
+                        clicked => { root.play-pause-clicked(); }
+                    }
+
+                    // Stop Button
+                    PlayerButton {
+                        text: "Stop";
+                        clicked => { root.stop-clicked(); }
+                    }
+
+                    // Read-only progress bar
+                    ProgressBar {
+                        value: root.timeline-progress;
+                    }
+
+                    // Timestamp Display
+                    Text {
+                        text: root.elapsed-time + " / " + root.total-duration;
+                        color: #f4f4f5;
+                        vertical-alignment: center;
+                        font-size: 14px;
+                        font-weight: 600;
+                        min-width: 90px;
+                    }
+
+                    // Volume icon + slider
+                    HorizontalLayout {
+                        spacing: 6px;
+                        width: 160px;
+
+                        Text {
+                            text: root.volume-level <= 0.0 ? "🔇" : root.volume-level < 0.5 ? "🔉" : "🔊";
+                            font-size: 16px;
+                            vertical-alignment: center;
+                            width: 24px;
+                        }
+
+                        volume-slider := PlaybackSlider {
+                            value: root.volume-level;
+                            min-width: 120px;
+                            seek(val) => {
+                                root.volume-level = val;
+                                root.volume-changed(val);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
