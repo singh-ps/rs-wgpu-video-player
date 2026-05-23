@@ -15,6 +15,7 @@ use frame_buffer::{Frame, FrameBuffer};
 mod probe;
 pub use probe::get_video_info;
 
+#[allow(dead_code)]
 #[derive(Default)]
 pub enum PixelFormat {
     #[default]
@@ -29,9 +30,10 @@ pub struct PlaybackParams {
 }
 
 pub struct VideoPlayer {
-    frame_buffer: FrameBuffer,
+    pub frame_buffer: FrameBuffer,
     is_initialized: bool,
     shutdown: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
 }
 
 impl VideoPlayer {
@@ -40,6 +42,7 @@ impl VideoPlayer {
             frame_buffer: FrameBuffer::new(),
             is_initialized: false,
             shutdown: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -53,12 +56,15 @@ impl VideoPlayer {
         }
 
         let shutdown_clone = self.shutdown.clone();
+        let paused_clone = self.paused.clone();
+        self.shutdown.store(false, Ordering::Relaxed);
+        self.paused.store(false, Ordering::Relaxed);
         self.is_initialized = true;
 
         tokio::task::spawn_blocking({
             let url = url.to_string();
             let buffer = self.frame_buffer.clone();
-            move || loop_decoder(url, params, buffer, shutdown_clone)
+            move || loop_decoder(url, params, buffer, shutdown_clone, paused_clone)
         });
 
         Ok(())
@@ -73,6 +79,29 @@ impl VideoPlayer {
         self.is_initialized = false;
     }
 
+    pub fn toggle_pause(&self) -> bool {
+        let current = self.paused.load(Ordering::Relaxed);
+        let new_state = !current;
+        self.paused.store(new_state, Ordering::Relaxed);
+        new_state
+    }
+
+    #[allow(dead_code)]
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn is_initialized(&self) -> bool {
+        self.is_initialized
+    }
+
+    #[allow(dead_code)]
     pub fn get_latest_frame(&mut self) -> Option<Arc<Frame>> {
         self.frame_buffer.consume()
     }

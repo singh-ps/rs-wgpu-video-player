@@ -2,6 +2,7 @@ use ffmpeg::{codec::context::Context, ffi::AV_TIME_BASE, format, media::Type};
 use ffmpeg_next as ffmpeg;
 use std::error::Error;
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct VideoInfo {
     pub width: u32,

@@ -24,6 +24,7 @@ pub fn loop_decoder(
     params: PlaybackParams,
     buffer: FrameBuffer,
     shutdown: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     ffmpeg::init()?;
 
@@ -72,6 +73,15 @@ pub fn loop_decoder(
     // Main demux/decode
     let mut pkt_ctr = 0usize;
     for (stream, packet) in ictx.packets() {
+        while paused.load(Ordering::Relaxed) {
+            if shutdown.load(Ordering::Relaxed) {
+                buffer.finish();
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            last_tick = Instant::now();
+        }
+
         if shutdown.load(Ordering::Relaxed) {
             buffer.finish();
             return Ok(());
@@ -96,6 +106,15 @@ pub fn loop_decoder(
 
         // Drain frames produced by this packet
         while let Ok(()) = dec.receive_frame(&mut yuv) {
+            while paused.load(Ordering::Relaxed) {
+                if shutdown.load(Ordering::Relaxed) {
+                    buffer.finish();
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+                last_tick = Instant::now();
+            }
+
             if shutdown.load(Ordering::Relaxed) {
                 buffer.finish();
                 return Ok(());
@@ -139,6 +158,15 @@ pub fn loop_decoder(
     // Flush (files). Live may not reach here.
     let _ = dec.send_eof();
     while dec.receive_frame(&mut yuv).is_ok() {
+        while paused.load(Ordering::Relaxed) {
+            if shutdown.load(Ordering::Relaxed) {
+                buffer.finish();
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            last_tick = Instant::now();
+        }
+
         if shutdown.load(Ordering::Relaxed) {
             buffer.finish();
             return Ok(());

@@ -27,6 +27,7 @@ impl FrameBuffer {
 
     /// Pull the latest frame from the buffer, if any. This does not consume the frame.
     #[inline]
+    #[allow(dead_code)]
     pub fn pull(&self) -> Option<Arc<Frame>> {
         self.rx.borrow().clone()
     }
@@ -38,6 +39,7 @@ impl FrameBuffer {
     }
 
     /// Subscribe to latest frames.
+    #[allow(dead_code)]
     pub async fn get_next(&mut self) -> Option<Arc<Frame>> {
         if self.rx.changed().await.is_ok() {
             self.rx.borrow().clone()

@@ -3,7 +3,6 @@ use std::{env, error::Error};
 mod app;
 use app::App;
 
-mod renderer;
 mod video_player;
 
 #[tokio::main]
