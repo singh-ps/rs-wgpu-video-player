@@ -215,6 +215,15 @@ impl App {
             }
         });
 
+        // Volume Callback — immediately update the atomic read by cpal
+        let player_clone = player.clone();
+        app.on_volume_changed(move |val| {
+            let vol = (val.clamp(0.0, 1.0) * 100.0).round() as u32;
+            if let Some(ref p) = *player_clone.lock().unwrap() {
+                p.set_volume(vol);
+            }
+        });
+
         // Kickoff initial playback if a URL was passed
         if !url.is_empty() {
             start_playback(url);

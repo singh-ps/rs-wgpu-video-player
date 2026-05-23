@@ -1,10 +1,13 @@
 use std::{
     error::Error,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
     },
 };
+
+mod audio_player;
+pub use audio_player::AudioPlayer;
 
 mod decoder;
 use decoder::loop_decoder;
@@ -31,18 +34,45 @@ pub struct PlaybackParams {
 
 pub struct VideoPlayer {
     pub frame_buffer: FrameBuffer,
+    pub audio_player: AudioPlayer,
     is_initialized: bool,
     shutdown: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    /// Volume 0–100, shared with AudioPlayer and the Slint UI.
+    volume: Arc<AtomicU32>,
+    /// Must be kept alive for the cpal stream to keep playing.
+    _audio_stream: Option<cpal::Stream>,
 }
 
 impl VideoPlayer {
     pub fn new() -> Self {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        let volume = Arc::new(AtomicU32::new(100));
+
+        let audio_player = AudioPlayer::new(volume.clone(), paused.clone(), shutdown.clone());
+
+        // Start cpal output stream immediately; it will output silence until the
+        // decoder pushes samples.
+        let _audio_stream = match audio_player.start_stream() {
+            Ok(s) => {
+                eprintln!("[VideoPlayer] cpal audio stream started");
+                Some(s)
+            }
+            Err(e) => {
+                eprintln!("[VideoPlayer] Failed to open audio output: {e}");
+                None
+            }
+        };
+
         Self {
             frame_buffer: FrameBuffer::new(),
+            audio_player,
             is_initialized: false,
-            shutdown: Arc::new(AtomicBool::new(false)),
-            paused: Arc::new(AtomicBool::new(false)),
+            shutdown,
+            paused,
+            volume,
+            _audio_stream,
         }
     }
 
@@ -61,10 +91,12 @@ impl VideoPlayer {
         self.paused.store(false, Ordering::Relaxed);
         self.is_initialized = true;
 
+        let audio_clone = self.audio_player.clone();
+
         tokio::task::spawn_blocking({
             let url = url.to_string();
             let buffer = self.frame_buffer.clone();
-            move || loop_decoder(url, params, buffer, shutdown_clone, paused_clone)
+            move || loop_decoder(url, params, buffer, Some(audio_clone), shutdown_clone, paused_clone)
         });
 
         Ok(())
@@ -74,7 +106,6 @@ impl VideoPlayer {
         if !self.is_initialized {
             return;
         }
-
         self.shutdown.store(true, Ordering::Relaxed);
         self.is_initialized = false;
     }
@@ -84,6 +115,17 @@ impl VideoPlayer {
         let new_state = !current;
         self.paused.store(new_state, Ordering::Relaxed);
         new_state
+    }
+
+    /// Set volume level 0–100. Immediately reflected in the cpal callback.
+    pub fn set_volume(&self, vol: u32) {
+        self.volume.store(vol.clamp(0, 100), Ordering::Relaxed);
+    }
+
+    /// Get the current volume level 0–100.
+    #[allow(dead_code)]
+    pub fn get_volume(&self) -> u32 {
+        self.volume.load(Ordering::Relaxed)
     }
 
     #[allow(dead_code)]

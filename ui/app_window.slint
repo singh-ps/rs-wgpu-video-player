@@ -92,11 +92,13 @@ export component AppWindow inherits Window {
     in property <bool> is-playing: false;
     in-out property <string> current-url: "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8";
     in-out property <float> timeline-progress: 0.0; // 0.0 to 1.0
+    in-out property <float> volume-level: 1.0; // 0.0 to 1.0
 
     callback play-pause-clicked();
     callback stop-clicked();
     callback load-url-clicked(string);
     callback seek-progress(float);
+    callback volume-changed(float);
 
     VerticalLayout {
         padding: 16px;
@@ -213,6 +215,27 @@ export component AppWindow inherits Window {
                         font-size: 14px;
                         font-weight: 600;
                         min-width: 90px;
+                    }
+
+                    // Volume icon + slider
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: center;
+                        width: 140px;
+
+                        Text {
+                            text: root.volume-level <= 0.0 ? "🔇" : root.volume-level < 0.5 ? "🔉" : "🔊";
+                            font-size: 16px;
+                            vertical-alignment: center;
+                        }
+
+                        volume-slider := PlaybackSlider {
+                            value: root.volume-level;
+                            seek(val) => {
+                                root.volume-level = val;
+                                root.volume-changed(val);
+                            }
+                        }
                     }
                 }
             }
