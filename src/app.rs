@@ -1,11 +1,16 @@
 use crate::video_player::{get_video_info, VideoPlayer};
 use std::{
     error::Error,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 use slint::{Image, SharedPixelBuffer, Rgba8Pixel, ComponentHandle};
 
 slint::include_modules!();
+
+/// Lock helper: recover from poisoning instead of panicking.
+fn lock<'a, T>(m: &'a Mutex<T>) -> MutexGuard<'a, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 fn format_time(secs: f64) -> String {
     let total_secs = secs.round() as u64;
@@ -41,12 +46,12 @@ impl App {
             let app_weak = app.as_weak();
             move || {
                 // Abort the active frame updater thread
-                if let Some(handle) = listener_handle.lock().unwrap().take() {
+                if let Some(handle) = lock(&listener_handle).take() {
                     handle.abort();
                 }
 
                 // Stop the actual decoder thread
-                if let Some(mut p) = player.lock().unwrap().take() {
+                if let Some(mut p) = lock(&player).take() {
                     p.stop_playback();
                 }
 
@@ -83,7 +88,7 @@ impl App {
                     if let Ok(info) = get_video_info(&url_clone) {
                         if let Some(dur_us) = info.duration_us {
                             let secs = dur_us as f64 / 1_000_000.0;
-                            *duration_secs_clone.lock().unwrap() = secs;
+                            *lock(&duration_secs_clone) = secs;
                             
                             let formatted = format_time(secs);
                             let _ = app_weak_task.upgrade_in_event_loop(move |ui| {
@@ -114,7 +119,7 @@ impl App {
 
                 // Subscribe to frames before saving the player
                 let mut frame_rx = new_player.frame_buffer.subscribe();
-                *player.lock().unwrap() = Some(new_player);
+                *lock(&player) = Some(new_player);
 
                 // 3. Spawn a tokio task that waits for frames and updates the UI
                 let app_weak_listener = app_weak.clone();
@@ -138,7 +143,7 @@ impl App {
                             let elapsed_secs = ts_us as f64 / 1_000_000.0;
                             let elapsed_str = format_time(elapsed_secs);
 
-                            let total_secs = *duration_secs_listener.lock().unwrap();
+                            let total_secs = *lock(&duration_secs_listener);
                             let progress = if total_secs > 0.0 {
                                 (elapsed_secs / total_secs).clamp(0.0, 1.0)
                             } else {
@@ -164,7 +169,7 @@ impl App {
                     }
                 });
 
-                *listener_handle.lock().unwrap() = Some(handle);
+                *lock(&listener_handle) = Some(handle);
 
                 // Update UI status to playing
                 if let Some(ui) = app_weak.upgrade() {
@@ -180,7 +185,7 @@ impl App {
         let player_clone = player.clone();
         let app_weak = app.as_weak();
         app.on_play_pause_clicked(move || {
-            if let Some(ref p) = *player_clone.lock().unwrap() {
+            if let Some(ref p) = *lock(&player_clone) {
                 let is_paused = p.toggle_pause();
                 if let Some(ui) = app_weak.upgrade() {
                     ui.set_is_playing(!is_paused);
@@ -205,7 +210,7 @@ impl App {
         let duration_secs_clone = duration_secs.clone();
         let app_weak = app.as_weak();
         app.on_seek_progress(move |percentage| {
-            let total = *duration_secs_clone.lock().unwrap();
+            let total = *lock(&duration_secs_clone);
             if total > 0.0 {
                 let target_secs = total * percentage as f64;
                 if let Some(ui) = app_weak.upgrade() {
@@ -219,7 +224,7 @@ impl App {
         let player_clone = player.clone();
         app.on_volume_changed(move |val| {
             let vol = (val.clamp(0.0, 1.0) * 100.0).round() as u32;
-            if let Some(ref p) = *player_clone.lock().unwrap() {
+            if let Some(ref p) = *lock(&player_clone) {
                 p.set_volume(vol);
             }
         });
