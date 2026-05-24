@@ -1,3 +1,4 @@
+use crate::video_player::state::PlaybackState;
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     BuildStreamError, StreamConfig,
@@ -5,7 +6,7 @@ use cpal::{
 use std::{
     collections::VecDeque,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
 };
@@ -38,28 +39,17 @@ pub struct AudioPlayer {
     output_latency_us: Arc<AtomicU64>,
     /// Set true once callback has emitted at least one real sample.
     started: Arc<AtomicBool>,
-    /// Volume 0–100 (shared with VideoPlayer / UI).
-    pub volume: Arc<AtomicU32>,
-    /// Pause flag — shared with VideoPlayer.
-    pub paused: Arc<AtomicBool>,
-    /// Shutdown flag — shared with VideoPlayer.
-    pub shutdown: Arc<AtomicBool>,
+    state: Arc<PlaybackState>,
 }
 
 impl AudioPlayer {
-    pub fn new(
-        volume: Arc<AtomicU32>,
-        paused: Arc<AtomicBool>,
-        shutdown: Arc<AtomicBool>,
-    ) -> Self {
+    pub fn new(state: Arc<PlaybackState>) -> Self {
         Self {
             samples: Arc::new(Mutex::new(VecDeque::with_capacity(RING_CAP))),
             samples_consumed: Arc::new(AtomicU64::new(0)),
             output_latency_us: Arc::new(AtomicU64::new(0)),
             started: Arc::new(AtomicBool::new(false)),
-            volume,
-            paused,
-            shutdown,
+            state,
         }
     }
 
@@ -88,7 +78,6 @@ impl AudioPlayer {
 
     /// Master clock: microseconds of audio audible at the speakers right now.
     /// Returns `None` before the stream has emitted any real samples.
-    #[allow(dead_code)]
     pub fn clock_us(&self) -> Option<u64> {
         if !self.started.load(Ordering::Relaxed) {
             return None;
@@ -117,9 +106,7 @@ impl AudioPlayer {
         let consumed = self.samples_consumed.clone();
         let latency_us = self.output_latency_us.clone();
         let started = self.started.clone();
-        let volume = self.volume.clone();
-        let paused = self.paused.clone();
-        let shutdown = self.shutdown.clone();
+        let state = self.state.clone();
 
         let stream = device
             .build_output_stream(
@@ -132,7 +119,7 @@ impl AudioPlayer {
                         let raw = d.as_micros() as u64;
                         latency_us.store(raw.min(MAX_LATENCY_US), Ordering::Relaxed);
                     }
-                    if shutdown.load(Ordering::Relaxed) || paused.load(Ordering::Relaxed) {
+                    if state.shutdown() || state.paused() {
                         // Silence; do NOT advance clock so video pacing pauses too.
                         for s in out.iter_mut() {
                             *s = 0.0;
@@ -140,7 +127,7 @@ impl AudioPlayer {
                         return;
                     }
 
-                    let vol = (volume.load(Ordering::Relaxed) as f32 / 100.0).clamp(0.0, 1.0);
+                    let vol = (state.volume() as f32 / 100.0).clamp(0.0, 1.0);
                     let mut real_written = 0usize;
                     match samples.try_lock() {
                         Ok(mut buf) => {
@@ -174,7 +161,7 @@ impl AudioPlayer {
                         consumed.fetch_add(out.len() as u64, Ordering::Relaxed);
                     }
                 },
-                |err| eprintln!("[AudioPlayer] cpal stream error: {err}"),
+                |err| tracing::warn!(target: "audio", "cpal stream error: {err}"),
                 None,
             )
             .map_err(|e: BuildStreamError| format!("Failed to build cpal stream: {e}"))?;

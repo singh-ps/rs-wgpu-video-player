@@ -1,7 +1,7 @@
 use crate::video_player::{
     audio_player::{AudioPlayer, CHANNELS, SAMPLE_RATE},
     frame_buffer::{Frame, FrameBuffer},
-    PixelFormat, PlaybackParams,
+    state::PlaybackState,
 };
 use ffmpeg::{
     codec::context::Context,
@@ -21,10 +21,7 @@ use ffmpeg_next as ffmpeg;
 use std::{
     error::Error,
     ffi::CStr,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
-    },
+    sync::{mpsc, Arc},
     time::{Duration, Instant},
 };
 
@@ -54,11 +51,9 @@ const PACE_SLICE: Duration = Duration::from_millis(20);
 
 pub fn loop_decoder(
     input: String,
-    params: PlaybackParams,
     buffer: FrameBuffer,
     audio: Option<AudioPlayer>,
-    shutdown: Arc<AtomicBool>,
-    paused: Arc<AtomicBool>,
+    state: Arc<PlaybackState>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut ictx = format::input(&input)?;
 
@@ -74,7 +69,7 @@ pub fn loop_decoder(
     let (aindex, aparams) = match (audio.as_ref(), ictx.streams().best(Type::Audio)) {
         (Some(_), Some(s)) => (s.index(), Some(s.parameters())),
         (Some(_), None) => {
-            eprintln!("[decoder] No audio stream in source — audio disabled.");
+            tracing::info!(target: "decoder", "no audio stream in source — audio disabled");
             (usize::MAX, None)
         }
         _ => (usize::MAX, None),
@@ -90,17 +85,13 @@ pub fn loop_decoder(
     };
 
     // ── Video decode thread ─────────────────────────────────────────────────
-    let v_shutdown = shutdown.clone();
-    let v_paused = paused.clone();
+    let v_state = state.clone();
     let v_buffer = buffer.clone();
-    let v_pix = params.pixel_format;
     let v_audio = audio.clone();
 
     let video_handle = std::thread::spawn(move || {
-        if let Err(e) = video_decode_thread(
-            vrx, vparams, vtb, v_pix, v_buffer, v_audio, v_shutdown, v_paused,
-        ) {
-            eprintln!("[decoder] video thread error: {e}");
+        if let Err(e) = video_decode_thread(vrx, vparams, vtb, v_buffer, v_audio, v_state) {
+            tracing::warn!(target: "video", "thread error: {e}");
         }
     });
 
@@ -108,10 +99,10 @@ pub fn loop_decoder(
     let demux_audio = audio.clone();
     let audio_handle = match (arx_opt, aparams, audio) {
         (Some(arx), Some(ap_params), Some(ap)) => {
-            let a_shutdown = shutdown.clone();
+            let a_state = state.clone();
             Some(std::thread::spawn(move || {
-                if let Err(e) = audio_decode_thread(arx, ap_params, ap, a_shutdown) {
-                    eprintln!("[decoder] audio thread error: {e}");
+                if let Err(e) = audio_decode_thread(arx, ap_params, ap, a_state) {
+                    tracing::warn!(target: "audio", "thread error: {e}");
                 }
             }))
         }
@@ -121,13 +112,13 @@ pub fn loop_decoder(
     // ── Demux loop ─────────────────────────────────────────────────────────
     'demux: for (stream, packet) in ictx.packets() {
         // Pause
-        while paused.load(Ordering::Relaxed) {
-            if shutdown.load(Ordering::Relaxed) {
+        while state.paused() {
+            if state.shutdown() {
                 break 'demux;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        if shutdown.load(Ordering::Relaxed) {
+        if state.shutdown() {
             break;
         }
 
@@ -144,8 +135,8 @@ pub fn loop_decoder(
                 // already well-stocked (~3 s), wait. This indirectly paces
                 // demuxing of further video packets via packet interleave
                 // order in the container.
-                wait_for_audio_room(&demux_audio, &shutdown, &paused);
-                if shutdown.load(Ordering::Relaxed) {
+                wait_for_audio_room(&demux_audio, &state);
+                if state.shutdown() {
                     break;
                 }
                 if tx.send(packet).is_err() {
@@ -159,11 +150,11 @@ pub fn loop_decoder(
     drop(atx_opt);
 
     if let Err(e) = video_handle.join() {
-        eprintln!("[decoder] video thread panicked: {e:?}");
+        tracing::warn!(target: "video", "thread panicked: {e:?}");
     }
     if let Some(h) = audio_handle {
         if let Err(e) = h.join() {
-            eprintln!("[decoder] audio thread panicked: {e:?}");
+            tracing::warn!(target: "audio", "thread panicked: {e:?}");
         }
     }
 
@@ -173,20 +164,16 @@ pub fn loop_decoder(
 
 /// Sleep the demux loop while the audio sample ring is already well-stocked.
 /// No-op when audio is not configured / not yet started.
-fn wait_for_audio_room(
-    audio: &Option<AudioPlayer>,
-    shutdown: &Arc<AtomicBool>,
-    paused: &Arc<AtomicBool>,
-) {
+fn wait_for_audio_room(audio: &Option<AudioPlayer>, state: &Arc<PlaybackState>) {
     let ap = match audio.as_ref() {
         Some(a) => a,
         None => return,
     };
     loop {
-        if shutdown.load(Ordering::Relaxed) {
+        if state.shutdown() {
             return;
         }
-        if paused.load(Ordering::Relaxed) {
+        if state.paused() {
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
@@ -197,16 +184,13 @@ fn wait_for_audio_room(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn video_decode_thread(
     rx: mpsc::Receiver<ffmpeg::Packet>,
     vparams: ffmpeg::codec::Parameters,
     vtb: ffmpeg::Rational,
-    pix: PixelFormat,
     buffer: FrameBuffer,
     audio: Option<AudioPlayer>,
-    shutdown: Arc<AtomicBool>,
-    paused: Arc<AtomicBool>,
+    state: Arc<PlaybackState>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // Build the decoder context, then attempt to attach a HW device BEFORE
     // calling avcodec_open2 (which happens inside `.open_as(codec)`).
@@ -223,10 +207,7 @@ fn video_decode_thread(
 
     let out_w = vdec.width();
     let out_h = vdec.height();
-    let out_pix = match pix {
-        PixelFormat::RGB24 => Pixel::RGB24,
-        PixelFormat::RGBA => Pixel::RGBA,
-    };
+    let out_pix = Pixel::RGBA;
 
     // Scaler is initialised lazily on the first decoded frame: with HW
     // decoding we don't know the post-transfer SW pixel format up front, and
@@ -243,33 +224,31 @@ fn video_decode_thread(
     let mut wall_anchor: Option<(Instant, u64)> = None;
 
     for packet in rx {
-        if shutdown.load(Ordering::Relaxed) {
+        if state.shutdown() {
             break;
         }
-        while paused.load(Ordering::Relaxed) {
-            if shutdown.load(Ordering::Relaxed) {
+        while state.paused() {
+            if state.shutdown() {
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(20));
         }
 
         if let Err(e) = vdec.send_packet(&packet) {
-            eprintln!("[video] send_packet error: {e}");
+            tracing::warn!(target: "video", "send_packet error: {e}");
             continue;
         }
         drain_video(&mut vdec, &mut scaler, &mut vyuv, &mut vout,
                     &mut first_pts_us, &mut wall_anchor, vtb, &buffer,
-                    out_pix, out_w, out_h, hw_pix_fmt, &audio,
-                    &shutdown, &paused);
+                    out_pix, out_w, out_h, hw_pix_fmt, &audio, &state);
     }
 
     if let Err(e) = vdec.send_eof() {
-        eprintln!("[video] send_eof error: {e}");
+        tracing::warn!(target: "video", "send_eof error: {e}");
     }
     drain_video(&mut vdec, &mut scaler, &mut vyuv, &mut vout,
                 &mut first_pts_us, &mut wall_anchor, vtb, &buffer,
-                out_pix, out_w, out_h, hw_pix_fmt, &audio,
-                &shutdown, &paused);
+                out_pix, out_w, out_h, hw_pix_fmt, &audio, &state);
 
     Ok(())
 }
@@ -314,7 +293,7 @@ unsafe fn try_enable_hw_decoder(
                 } else {
                     CStr::from_ptr(name_ptr).to_string_lossy().into_owned()
                 };
-                eprintln!("[video] hw decode enabled ({name})");
+                tracing::info!(target: "video", "hw decode enabled ({name})");
                 return Some(want_fmt);
             }
         }
@@ -354,11 +333,10 @@ fn drain_video(
     out_h: u32,
     hw_pix_fmt: Option<i32>,
     audio: &Option<AudioPlayer>,
-    shutdown: &Arc<AtomicBool>,
-    paused: &Arc<AtomicBool>,
+    state: &Arc<PlaybackState>,
 ) {
     while vdec.receive_frame(vyuv).is_ok() {
-        if shutdown.load(Ordering::Relaxed) {
+        if state.shutdown() {
             return;
         }
 
@@ -372,7 +350,7 @@ fn drain_video(
             Some(want) if raw_fmt == want => unsafe {
                 let r = av_hwframe_transfer_data(sw_frame.as_mut_ptr(), vyuv.as_ptr(), 0);
                 if r < 0 {
-                    eprintln!("[video] hw transfer failed (code {r})");
+                    tracing::warn!(target: "video", "hw transfer failed (code {r})");
                     continue;
                 }
                 &sw_frame
@@ -392,7 +370,7 @@ fn drain_video(
             match Scaler::get(src_fmt, src_w, src_h, out_pix, out_w, out_h, Flags::BILINEAR) {
                 Ok(s) => *scaler = Some((s, src_fmt, src_w, src_h)),
                 Err(e) => {
-                    eprintln!("[video] scaler init error: {e}");
+                    tracing::warn!(target: "video", "scaler init error: {e}");
                     continue;
                 }
             }
@@ -402,7 +380,7 @@ fn drain_video(
             None => continue,
         };
         if let Err(e) = s.run(src, vout) {
-            eprintln!("[video] scaling error: {e}");
+            tracing::warn!(target: "video", "scaling error: {e}");
             continue;
         }
 
@@ -414,7 +392,7 @@ fn drain_video(
 
         // Pace presentation against audio clock (or wall-clock fallback).
         // Drop frame if we're far past its display time.
-        if pace_video(audio, wall_anchor, ts_us, shutdown, paused) {
+        if pace_video(audio, wall_anchor, ts_us, state) {
             continue;
         }
 
@@ -436,19 +414,18 @@ fn pace_video(
     audio: &Option<AudioPlayer>,
     wall_anchor: &mut Option<(Instant, u64)>,
     ts_us: u64,
-    shutdown: &Arc<AtomicBool>,
-    paused: &Arc<AtomicBool>,
+    state: &Arc<PlaybackState>,
 ) -> bool {
     if let Some(ap) = audio.as_ref() {
-        if let Some(_) = ap.clock_us() {
+        if ap.clock_us().is_some() {
             *wall_anchor = None;
             let wait_start = Instant::now();
             loop {
-                if shutdown.load(Ordering::Relaxed) {
+                if state.shutdown() {
                     return false;
                 }
-                while paused.load(Ordering::Relaxed) {
-                    if shutdown.load(Ordering::Relaxed) {
+                while state.paused() {
+                    if state.shutdown() {
                         return false;
                     }
                     std::thread::sleep(PACE_SLICE);
@@ -483,7 +460,7 @@ fn pace_video(
         let sleep = (target - elapsed).min(PACE_SLICE);
         std::thread::sleep(sleep);
         // Loop until target reached or shutdown — keep responsive.
-        while !shutdown.load(Ordering::Relaxed) {
+        while !state.shutdown() {
             let elapsed = Instant::now().duration_since(start_inst);
             if elapsed >= target {
                 break;
@@ -500,7 +477,7 @@ fn audio_decode_thread(
     rx: mpsc::Receiver<ffmpeg::Packet>,
     aparams: ffmpeg::codec::Parameters,
     player: AudioPlayer,
-    shutdown: Arc<AtomicBool>,
+    state: Arc<PlaybackState>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let ctx = Context::from_parameters(aparams)?;
     let mut dec = ctx.decoder().audio()?;
@@ -523,20 +500,20 @@ fn audio_decode_thread(
     let mut frame = AudioFrame::empty();
 
     for packet in rx {
-        if shutdown.load(Ordering::Relaxed) {
+        if state.shutdown() {
             break;
         }
         if let Err(e) = dec.send_packet(&packet) {
-            eprintln!("[audio] send_packet error: {e}");
+            tracing::warn!(target: "audio", "send_packet error: {e}");
             continue;
         }
-        drain_audio(&mut dec, &mut resampler, &mut frame, &player, &shutdown);
+        drain_audio(&mut dec, &mut resampler, &mut frame, &player, &state);
     }
 
     if let Err(e) = dec.send_eof() {
-        eprintln!("[audio] send_eof error: {e}");
+        tracing::warn!(target: "audio", "send_eof error: {e}");
     }
-    drain_audio(&mut dec, &mut resampler, &mut frame, &player, &shutdown);
+    drain_audio(&mut dec, &mut resampler, &mut frame, &player, &state);
     flush_resampler(&mut resampler, &player);
     Ok(())
 }
@@ -546,15 +523,15 @@ fn drain_audio(
     resampler: &mut resampling::Context,
     frame: &mut AudioFrame,
     player: &AudioPlayer,
-    shutdown: &Arc<AtomicBool>,
+    state: &Arc<PlaybackState>,
 ) {
     while dec.receive_frame(frame).is_ok() {
-        if shutdown.load(Ordering::Relaxed) {
+        if state.shutdown() {
             return;
         }
         let mut resampled = AudioFrame::empty();
         if let Err(e) = resampler.run(frame, &mut resampled) {
-            eprintln!("[audio] resample error: {e}");
+            tracing::warn!(target: "audio", "resample error: {e}");
             continue;
         }
         push_resampled(&resampled, player);
@@ -572,7 +549,7 @@ fn flush_resampler(resampler: &mut resampling::Context, player: &AudioPlayer) {
                 push_resampled(&more, player);
             }
             Err(e) => {
-                eprintln!("[audio] resampler flush error: {e}");
+                tracing::warn!(target: "audio", "resampler flush error: {e}");
                 break;
             }
         }

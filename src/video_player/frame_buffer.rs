@@ -32,22 +32,6 @@ impl FrameBuffer {
         self.rx.borrow().clone()
     }
 
-    /// Consume the latest frame from the buffer.
-    #[inline]
-    pub fn consume(&mut self) -> Option<Arc<Frame>> {
-        self.rx.borrow_and_update().clone()
-    }
-
-    /// Subscribe to latest frames.
-    #[allow(dead_code)]
-    pub async fn get_next(&mut self) -> Option<Arc<Frame>> {
-        if self.rx.changed().await.is_ok() {
-            self.rx.borrow().clone()
-        } else {
-            None
-        }
-    }
-
     /// Finish the frame buffer, no more frames will be pushed.
     pub fn finish(&self) {
         let _ = self.tx.send(None);

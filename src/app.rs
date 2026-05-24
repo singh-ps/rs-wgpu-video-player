@@ -102,15 +102,12 @@ impl App {
                 let start_res = tokio::task::block_in_place(|| {
                     let rt = tokio::runtime::Handle::current();
                     rt.block_on(async {
-                        new_player.start_playback(
-                            &stream_url,
-                            Default::default()
-                        ).await
+                        new_player.start_playback(&stream_url).await
                     })
                 });
 
                 if let Err(e) = start_res {
-                    eprintln!("Failed to start playback: {:?}", e);
+                    tracing::warn!(target: "app", "failed to start playback: {e:?}");
                     if let Some(ui) = app_weak.upgrade() {
                         ui.set_status_text(format!("Error: {}", e).into());
                     }
