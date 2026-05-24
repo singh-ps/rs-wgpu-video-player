@@ -14,10 +14,7 @@ pub struct VideoInfo {
 pub fn get_video_info(input: &str) -> Result<VideoInfo, Box<dyn Error>> {
     ffmpeg::init()?;
     let ictx = format::input(input)?;
-    let vstream = ictx
-        .streams()
-        .best(Type::Video)
-        .ok_or_else(|| "No video stream")?;
+    let vstream = ictx.streams().best(Type::Video).ok_or("No video stream")?;
 
     let ctx = Context::from_parameters(vstream.parameters())?;
     let dec = ctx.decoder().video()?;

@@ -7,10 +7,7 @@ use crate::video_player::{
 use ffmpeg::{
     codec::context::Context,
     software::scaling::{Context as Scaler, Flags},
-    util::{
-        format::Pixel,
-        frame::Video,
-    },
+    util::{format::Pixel, frame::Video},
 };
 use ffmpeg_next as ffmpeg;
 use std::{
@@ -19,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ffmpeg::ffi::{av_hwframe_transfer_data, AVCodec};
+use ffmpeg::ffi::av_hwframe_transfer_data;
 
 /// Drop a video frame if it would be displayed more than this far past its
 /// PTS — i.e. the decoder is falling behind real-time.
@@ -44,9 +41,8 @@ pub fn video_decode_thread(
     let codec = ffmpeg::decoder::find(codec_id).ok_or("decoder not found for codec")?;
 
     let mut dec_wrap = ctx.decoder();
-    let hw_pix_fmt: Option<i32> = unsafe {
-        try_enable_hw_decoder(dec_wrap.as_mut_ptr(), codec.as_ptr() as *const AVCodec)
-    };
+    let hw_pix_fmt: Option<i32> =
+        unsafe { try_enable_hw_decoder(dec_wrap.as_mut_ptr(), codec.as_ptr()) };
 
     let mut vdec = dec_wrap.open_as(codec).and_then(|o| o.video())?;
 
@@ -83,17 +79,43 @@ pub fn video_decode_thread(
             tracing::warn!(target: "video", "send_packet error: {e}");
             continue;
         }
-        drain_video(&mut vdec, &mut scaler, &mut vyuv, &mut vout,
-                    &mut first_pts_us, &mut wall_anchor, vtb, &buffer,
-                    out_pix, out_w, out_h, hw_pix_fmt, &audio, &state);
+        drain_video(
+            &mut vdec,
+            &mut scaler,
+            &mut vyuv,
+            &mut vout,
+            &mut first_pts_us,
+            &mut wall_anchor,
+            vtb,
+            &buffer,
+            out_pix,
+            out_w,
+            out_h,
+            hw_pix_fmt,
+            &audio,
+            &state,
+        );
     }
 
     if let Err(e) = vdec.send_eof() {
         tracing::warn!(target: "video", "send_eof error: {e}");
     }
-    drain_video(&mut vdec, &mut scaler, &mut vyuv, &mut vout,
-                &mut first_pts_us, &mut wall_anchor, vtb, &buffer,
-                out_pix, out_w, out_h, hw_pix_fmt, &audio, &state);
+    drain_video(
+        &mut vdec,
+        &mut scaler,
+        &mut vyuv,
+        &mut vout,
+        &mut first_pts_us,
+        &mut wall_anchor,
+        vtb,
+        &buffer,
+        out_pix,
+        out_w,
+        out_h,
+        hw_pix_fmt,
+        &audio,
+        &state,
+    );
 
     Ok(())
 }
@@ -147,7 +169,15 @@ fn drain_video(
             None => true,
         };
         if need_init {
-            match Scaler::get(src_fmt, src_w, src_h, out_pix, out_w, out_h, Flags::BILINEAR) {
+            match Scaler::get(
+                src_fmt,
+                src_w,
+                src_h,
+                out_pix,
+                out_w,
+                out_h,
+                Flags::BILINEAR,
+            ) {
                 Ok(s) => *scaler = Some((s, src_fmt, src_w, src_h)),
                 Err(e) => {
                     tracing::warn!(target: "video", "scaler init error: {e}");
