@@ -4,14 +4,15 @@ mod hw;
 mod video;
 
 use crate::video_player::{
-    audio_player::AudioPlayer, frame_buffer::FrameBuffer, state::PlaybackState,
+    audio_player::AudioPlayer,
+    error::{PlayerError, Result},
+    event::PlaybackEvent,
+    state::PlaybackState,
 };
 use ffmpeg::{format, media::Type};
 use ffmpeg_next as ffmpeg;
-use std::{
-    error::Error,
-    sync::{mpsc, Arc},
-};
+use std::sync::{mpsc, Arc};
+use tokio::sync::mpsc::UnboundedSender;
 
 /// Bounded packet queues. Sized generously so demux only ever blocks when the
 /// audio decoder genuinely needs backpressure (see demux::wait_for_audio_room).
@@ -20,10 +21,10 @@ const AUDIO_PKT_QUEUE: usize = 1024;
 
 pub fn loop_decoder(
     input: String,
-    buffer: FrameBuffer,
+    events: UnboundedSender<PlaybackEvent>,
     audio: Option<AudioPlayer>,
     state: Arc<PlaybackState>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+) -> Result<()> {
     let mut ictx = format::input(&input)?;
 
     // ── Stream discovery ─────────────────────────────────────────────────────
@@ -31,7 +32,7 @@ pub fn loop_decoder(
         let vstream = ictx
             .streams()
             .best(Type::Video)
-            .ok_or("No video stream found")?;
+            .ok_or(PlayerError::NoVideoStream)?;
         (vstream.index(), vstream.parameters(), vstream.time_base())
     };
 
@@ -55,11 +56,11 @@ pub fn loop_decoder(
 
     // ── Video decode thread ─────────────────────────────────────────────────
     let v_state = state.clone();
-    let v_buffer = buffer.clone();
+    let v_events = events.clone();
     let v_audio = audio.clone();
 
     let video_handle = std::thread::spawn(move || {
-        if let Err(e) = video::video_decode_thread(vrx, vparams, vtb, v_buffer, v_audio, v_state) {
+        if let Err(e) = video::video_decode_thread(vrx, vparams, vtb, v_events, v_audio, v_state) {
             tracing::warn!(target: "video", "thread error: {e}");
         }
     });
@@ -100,7 +101,7 @@ pub fn loop_decoder(
         }
     }
 
-    buffer.finish();
+    let _ = events.send(PlaybackEvent::Ended);
     Ok(())
 }
 

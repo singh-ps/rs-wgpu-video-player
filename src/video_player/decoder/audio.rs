@@ -1,5 +1,6 @@
 use crate::video_player::{
     audio_player::{AudioPlayer, CHANNELS, SAMPLE_RATE},
+    error::Result,
     state::PlaybackState,
 };
 use ffmpeg::{
@@ -12,17 +13,14 @@ use ffmpeg::{
     },
 };
 use ffmpeg_next as ffmpeg;
-use std::{
-    error::Error,
-    sync::{mpsc, Arc},
-};
+use std::sync::{mpsc, Arc};
 
 pub fn audio_decode_thread(
     rx: mpsc::Receiver<ffmpeg::Packet>,
     aparams: ffmpeg::codec::Parameters,
     player: AudioPlayer,
     state: Arc<PlaybackState>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+) -> Result<()> {
     let ctx = Context::from_parameters(aparams)?;
     let mut dec = ctx.decoder().audio()?;
 

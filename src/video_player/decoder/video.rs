@@ -1,9 +1,12 @@
 use crate::video_player::{
     audio_player::AudioPlayer,
     decoder::{hw::try_enable_hw_decoder, pts_to_us},
-    frame_buffer::{Frame, FrameBuffer},
+    error::{PlayerError, Result},
+    event::PlaybackEvent,
+    frame_buffer::Frame,
     state::PlaybackState,
 };
+use tokio::sync::mpsc::UnboundedSender;
 use ffmpeg::{
     codec::context::Context,
     software::scaling::{Context as Scaler, Flags},
@@ -11,7 +14,6 @@ use ffmpeg::{
 };
 use ffmpeg_next as ffmpeg;
 use std::{
-    error::Error,
     sync::{mpsc, Arc},
     time::{Duration, Instant},
 };
@@ -30,15 +32,15 @@ pub fn video_decode_thread(
     rx: mpsc::Receiver<ffmpeg::Packet>,
     vparams: ffmpeg::codec::Parameters,
     vtb: ffmpeg::Rational,
-    buffer: FrameBuffer,
+    events: UnboundedSender<PlaybackEvent>,
     audio: Option<AudioPlayer>,
     state: Arc<PlaybackState>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+) -> Result<()> {
     // Build the decoder context, then attempt to attach a HW device BEFORE
     // calling avcodec_open2 (which happens inside `.open_as(codec)`).
     let ctx = Context::from_parameters(vparams)?;
     let codec_id = ctx.id();
-    let codec = ffmpeg::decoder::find(codec_id).ok_or("decoder not found for codec")?;
+    let codec = ffmpeg::decoder::find(codec_id).ok_or(PlayerError::DecoderNotFound)?;
 
     let mut dec_wrap = ctx.decoder();
     let hw_pix_fmt: Option<i32> =
@@ -87,7 +89,7 @@ pub fn video_decode_thread(
             &mut first_pts_us,
             &mut wall_anchor,
             vtb,
-            &buffer,
+            &events,
             out_pix,
             out_w,
             out_h,
@@ -108,7 +110,7 @@ pub fn video_decode_thread(
         &mut first_pts_us,
         &mut wall_anchor,
         vtb,
-        &buffer,
+        &events,
         out_pix,
         out_w,
         out_h,
@@ -129,7 +131,7 @@ fn drain_video(
     first_pts_us: &mut Option<u64>,
     wall_anchor: &mut Option<(Instant, u64)>,
     vtb: ffmpeg::Rational,
-    buffer: &FrameBuffer,
+    events: &UnboundedSender<PlaybackEvent>,
     out_pix: Pixel,
     out_w: u32,
     out_h: u32,
@@ -208,12 +210,12 @@ fn drain_video(
 
         let plane = vout.data(0);
         let pixels: Arc<[u8]> = Vec::from(plane).into();
-        buffer.push(Arc::new(Frame {
+        let _ = events.send(PlaybackEvent::Frame(Arc::new(Frame {
             data: pixels,
             width: out_w,
             height: out_h,
             ts_us,
-        }));
+        })));
     }
 }
 
