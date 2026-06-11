@@ -1,0 +1,11 @@
+[package]
+name = "player-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ffmpeg-next = "=8.0.0"
+tokio = { version = "1.47.1", features = ["rt", "sync"] }
+cpal = "0.15"
+tracing = "0.1"
+thiserror = "2"

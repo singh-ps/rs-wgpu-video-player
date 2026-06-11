@@ -1,7 +1,5 @@
-use crate::video_player::{
-    audio_player::{AudioPlayer, CHANNELS, SAMPLE_RATE},
-    error::Result,
-    state::PlaybackState,
+use crate::{
+    audio_player::AudioPlayer, config::PlaybackConfig, error::Result, state::PlaybackState,
 };
 use ffmpeg::{
     codec::context::Context,
@@ -20,6 +18,7 @@ pub fn audio_decode_thread(
     aparams: ffmpeg::codec::Parameters,
     player: AudioPlayer,
     state: Arc<PlaybackState>,
+    cfg: PlaybackConfig,
 ) -> Result<()> {
     let ctx = Context::from_parameters(aparams)?;
     let mut dec = ctx.decoder().audio()?;
@@ -36,7 +35,7 @@ pub fn audio_decode_thread(
         dec.rate(),
         Sample::F32(SampleType::Packed),
         ChannelLayout::STEREO,
-        SAMPLE_RATE,
+        cfg.audio_sample_rate,
     )?;
 
     let mut frame = AudioFrame::empty();
@@ -49,14 +48,14 @@ pub fn audio_decode_thread(
             tracing::warn!(target: "audio", "send_packet error: {e}");
             continue;
         }
-        drain_audio(&mut dec, &mut resampler, &mut frame, &player, &state);
+        drain_audio(&mut dec, &mut resampler, &mut frame, &player, &state, &cfg);
     }
 
     if let Err(e) = dec.send_eof() {
         tracing::warn!(target: "audio", "send_eof error: {e}");
     }
-    drain_audio(&mut dec, &mut resampler, &mut frame, &player, &state);
-    flush_resampler(&mut resampler, &player);
+    drain_audio(&mut dec, &mut resampler, &mut frame, &player, &state, &cfg);
+    flush_resampler(&mut resampler, &player, &cfg);
     Ok(())
 }
 
@@ -66,6 +65,7 @@ fn drain_audio(
     frame: &mut AudioFrame,
     player: &AudioPlayer,
     state: &Arc<PlaybackState>,
+    cfg: &PlaybackConfig,
 ) {
     while dec.receive_frame(frame).is_ok() {
         if state.shutdown() {
@@ -76,11 +76,15 @@ fn drain_audio(
             tracing::warn!(target: "audio", "resample error: {e}");
             continue;
         }
-        push_resampled(&resampled, player);
+        push_resampled(&resampled, player, cfg);
     }
 }
 
-fn flush_resampler(resampler: &mut resampling::Context, player: &AudioPlayer) {
+fn flush_resampler(
+    resampler: &mut resampling::Context,
+    player: &AudioPlayer,
+    cfg: &PlaybackConfig,
+) {
     loop {
         let mut more = AudioFrame::empty();
         match resampler.flush(&mut more) {
@@ -88,7 +92,7 @@ fn flush_resampler(resampler: &mut resampling::Context, player: &AudioPlayer) {
                 if more.samples() == 0 {
                     break;
                 }
-                push_resampled(&more, player);
+                push_resampled(&more, player, cfg);
             }
             Err(e) => {
                 tracing::warn!(target: "audio", "resampler flush error: {e}");
@@ -98,12 +102,12 @@ fn flush_resampler(resampler: &mut resampling::Context, player: &AudioPlayer) {
     }
 }
 
-fn push_resampled(resampled: &AudioFrame, player: &AudioPlayer) {
+fn push_resampled(resampled: &AudioFrame, player: &AudioPlayer, cfg: &PlaybackConfig) {
     let n_per_ch = resampled.samples();
     if n_per_ch == 0 {
         return;
     }
-    let n_samples = n_per_ch.checked_mul(CHANNELS as usize).unwrap_or(0);
+    let n_samples = n_per_ch.checked_mul(cfg.audio_channels as usize).unwrap_or(0);
     if n_samples == 0 {
         return;
     }

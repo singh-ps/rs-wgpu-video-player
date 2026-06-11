@@ -1,8 +1,15 @@
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
+/// Opaque handle to the live audio output stream. Hold it for as long as you
+/// want audio to play; dropping it silences the device.
+pub type AudioStream = cpal::Stream;
+
 mod audio_player;
 pub use audio_player::AudioPlayer;
+
+mod config;
+pub use config::PlaybackConfig;
 
 mod decoder;
 use decoder::loop_decoder;
@@ -14,26 +21,30 @@ mod event;
 pub use event::PlaybackEvent;
 
 mod frame_buffer;
-
-mod probe;
-use probe::get_video_info;
+pub use frame_buffer::{Frame, FrameBuffer};
 
 mod state;
 use state::PlaybackState;
 
 pub struct VideoPlayer {
     pub audio_player: AudioPlayer,
+    pub frame_buffer: FrameBuffer,
     is_initialized: bool,
     state: Arc<PlaybackState>,
+    cfg: PlaybackConfig,
 }
 
 impl VideoPlayer {
     /// Returns the player together with the cpal output stream. Caller must
     /// keep the stream alive for audio playback to continue; dropping it
     /// silences the stream.
-    pub fn new() -> (Self, Option<cpal::Stream>) {
+    pub fn new() -> (Self, Option<AudioStream>) {
+        Self::with_config(PlaybackConfig::default())
+    }
+
+    pub fn with_config(cfg: PlaybackConfig) -> (Self, Option<AudioStream>) {
         let state = Arc::new(PlaybackState::new());
-        let audio_player = AudioPlayer::new(state.clone());
+        let audio_player = AudioPlayer::new(state.clone(), cfg);
 
         let audio_stream = match audio_player.start_stream() {
             Ok(s) => {
@@ -48,8 +59,10 @@ impl VideoPlayer {
 
         let player = Self {
             audio_player,
+            frame_buffer: FrameBuffer::new(),
             is_initialized: false,
             state,
+            cfg,
         };
         (player, audio_stream)
     }
@@ -64,25 +77,13 @@ impl VideoPlayer {
 
         let (tx, rx) = mpsc::unbounded_channel::<PlaybackEvent>();
 
-        // Probe runs in parallel with playback — emits Duration once known.
-        let probe_tx = tx.clone();
-        let probe_url = url.to_string();
-        tokio::task::spawn_blocking(move || {
-            match get_video_info(&probe_url) {
-                Ok(info) => {
-                    if let Some(dur) = info.duration_us {
-                        let _ = probe_tx.send(PlaybackEvent::Duration(dur as u64));
-                    }
-                }
-                Err(e) => tracing::warn!(target: "probe", "failed: {e}"),
-            }
-        });
-
         let audio = self.audio_player.clone();
         let state = self.state.clone();
+        let cfg = self.cfg;
+        let buffer = self.frame_buffer.clone();
         let dec_url = url.to_string();
         tokio::task::spawn_blocking(move || {
-            if let Err(e) = loop_decoder(dec_url, tx.clone(), Some(audio), state) {
+            if let Err(e) = loop_decoder(dec_url, buffer, tx.clone(), Some(audio), state, cfg) {
                 let _ = tx.send(PlaybackEvent::Error(format!("{e}")));
             }
         });

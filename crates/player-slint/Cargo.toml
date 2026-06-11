@@ -1,0 +1,18 @@
+[package]
+name = "player-slint"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rs-wgpu-video-player"
+path = "src/main.rs"
+
+[dependencies]
+player-core = { path = "../player-core" }
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "sync"] }
+slint = "1.16.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[build-dependencies]
+slint-build = "1.16.1"

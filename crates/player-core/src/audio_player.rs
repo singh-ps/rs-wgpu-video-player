@@ -1,4 +1,4 @@
-use crate::video_player::state::PlaybackState;
+use crate::{config::PlaybackConfig, state::PlaybackState};
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     BuildStreamError, StreamConfig,
@@ -11,61 +11,44 @@ use std::{
     },
 };
 
-pub const SAMPLE_RATE: u32 = 48_000;
-pub const CHANNELS: u16 = 2;
-
-/// Max queued interleaved samples (~5 s stereo @ 48 kHz). Large enough to
-/// absorb the demux burst at startup without dropping anything; small enough
-/// to bound memory.
-const RING_CAP: usize = (SAMPLE_RATE as usize) * (CHANNELS as usize) * 5;
-
-/// Cap on driver-reported output latency. Real WASAPI / CoreAudio / Pulse
-/// latencies are tens of ms; values above this are almost certainly a buggy
-/// timestamp and would push the audio clock into the past, stalling video.
-const MAX_LATENCY_US: u64 = 200_000;
-
-/// Decoded interleaved f32 PCM (stereo 48 kHz) ring + master playback clock.
-/// Decoder thread pushes via [`AudioPlayer::push`]; the cpal callback drains
-/// inside [`AudioPlayer::start_stream`] and advances [`samples_consumed`].
+/// Decoded interleaved f32 PCM ring + master playback clock. Decoder thread
+/// pushes via [`AudioPlayer::push`]; the cpal callback drains inside
+/// [`AudioPlayer::start_stream`] and advances `samples_consumed`.
 #[derive(Clone)]
 pub struct AudioPlayer {
-    /// Interleaved stereo f32 samples queued for playback.
+    /// Interleaved f32 samples queued for playback.
     samples: Arc<Mutex<VecDeque<f32>>>,
     /// Interleaved samples written to the driver. Combined with the device
     /// output latency this yields the audible playback clock.
     samples_consumed: Arc<AtomicU64>,
-    /// Device output buffer latency in microseconds (driver-reported). The
-    /// callback fills `playback - callback` from cpal's `OutputCallbackInfo`.
+    /// Device output buffer latency in microseconds (driver-reported).
     output_latency_us: Arc<AtomicU64>,
-    /// Set true once callback has emitted at least one real sample.
+    /// Set true once the callback has emitted at least one real sample.
     started: Arc<AtomicBool>,
     state: Arc<PlaybackState>,
+    cfg: PlaybackConfig,
 }
 
 impl AudioPlayer {
-    pub fn new(state: Arc<PlaybackState>) -> Self {
+    pub fn new(state: Arc<PlaybackState>, cfg: PlaybackConfig) -> Self {
+        let ring_cap = ring_cap_samples(&cfg);
         Self {
-            samples: Arc::new(Mutex::new(VecDeque::with_capacity(RING_CAP))),
+            samples: Arc::new(Mutex::new(VecDeque::with_capacity(ring_cap))),
             samples_consumed: Arc::new(AtomicU64::new(0)),
             output_latency_us: Arc::new(AtomicU64::new(0)),
             started: Arc::new(AtomicBool::new(false)),
             state,
+            cfg,
         }
     }
 
-    /// Push decoded samples (interleaved stereo f32). Drops oldest on overflow.
+    /// Push decoded samples (interleaved f32). Drops oldest on overflow.
     pub fn push(&self, data: &[f32]) {
         let mut buf = match self.samples.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let total = buf.len() + data.len();
-        if total > RING_CAP {
-            let overflow = total - RING_CAP;
-            let drop_n = overflow.min(buf.len());
-            buf.drain(..drop_n);
-        }
-        buf.extend(data.iter().copied());
+        push_with_drop_oldest(&mut buf, data, ring_cap_samples(&self.cfg));
     }
 
     /// Interleaved samples currently queued for playback.
@@ -83,10 +66,12 @@ impl AudioPlayer {
             return None;
         }
         let consumed = self.samples_consumed.load(Ordering::Relaxed);
-        let per_channel = consumed / (CHANNELS as u64);
-        let written_us = per_channel.saturating_mul(1_000_000) / (SAMPLE_RATE as u64);
-        let latency_us = self.output_latency_us.load(Ordering::Relaxed);
-        Some(written_us.saturating_sub(latency_us))
+        Some(audio_clock_us(
+            consumed,
+            self.output_latency_us.load(Ordering::Relaxed),
+            self.cfg.audio_sample_rate,
+            self.cfg.audio_channels,
+        ))
     }
 
     /// Open the cpal output stream. Returned stream must be kept alive.
@@ -97,8 +82,8 @@ impl AudioPlayer {
             .ok_or("No default audio output device found")?;
 
         let config = StreamConfig {
-            channels: CHANNELS,
-            sample_rate: cpal::SampleRate(SAMPLE_RATE),
+            channels: self.cfg.audio_channels,
+            sample_rate: cpal::SampleRate(self.cfg.audio_sample_rate),
             buffer_size: cpal::BufferSize::Default,
         };
 
@@ -107,6 +92,7 @@ impl AudioPlayer {
         let latency_us = self.output_latency_us.clone();
         let started = self.started.clone();
         let state = self.state.clone();
+        let max_latency_us = self.cfg.max_audio_latency_us;
 
         let stream = device
             .build_output_stream(
@@ -117,7 +103,7 @@ impl AudioPlayer {
                     let ts = info.timestamp();
                     if let Some(d) = ts.playback.duration_since(&ts.callback) {
                         let raw = d.as_micros() as u64;
-                        latency_us.store(raw.min(MAX_LATENCY_US), Ordering::Relaxed);
+                        latency_us.store(raw.min(max_latency_us), Ordering::Relaxed);
                     }
                     if state.shutdown() || state.paused() {
                         // Silence; do NOT advance clock so video pacing pauses too.
@@ -168,5 +154,102 @@ impl AudioPlayer {
 
         stream.play()?;
         Ok(stream)
+    }
+}
+
+pub(crate) fn ring_cap_samples(cfg: &PlaybackConfig) -> usize {
+    (cfg.audio_sample_rate as f32 * cfg.audio_channels as f32 * cfg.sample_ring_cap_secs) as usize
+}
+
+/// Push samples into the ring; drop oldest when capacity is exceeded. Pure;
+/// no synchronisation. See tests for the invariant.
+pub(crate) fn push_with_drop_oldest(buf: &mut VecDeque<f32>, data: &[f32], cap: usize) {
+    let total = buf.len() + data.len();
+    if total > cap {
+        let overflow = total - cap;
+        let drop_n = overflow.min(buf.len());
+        buf.drain(..drop_n);
+    }
+    buf.extend(data.iter().copied());
+}
+
+/// Audio clock math: convert sample counts and driver latency into the
+/// microsecond timestamp of audio that is audible *now*. Pure.
+pub(crate) fn audio_clock_us(
+    samples_consumed: u64,
+    output_latency_us: u64,
+    sample_rate: u32,
+    channels: u16,
+) -> u64 {
+    let per_channel = samples_consumed / channels as u64;
+    let written_us = per_channel.saturating_mul(1_000_000) / sample_rate as u64;
+    written_us.saturating_sub(output_latency_us)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ring_push_under_capacity_preserves_all() {
+        let mut buf = VecDeque::new();
+        push_with_drop_oldest(&mut buf, &[1.0, 2.0, 3.0], 10);
+        assert_eq!(buf, VecDeque::from(vec![1.0, 2.0, 3.0]));
+    }
+
+    #[test]
+    fn ring_push_at_capacity_keeps_newest() {
+        let mut buf = VecDeque::from(vec![1.0, 2.0, 3.0]);
+        push_with_drop_oldest(&mut buf, &[4.0, 5.0], 4);
+        // total = 5; cap = 4; drop 1 oldest, append both newest.
+        assert_eq!(buf, VecDeque::from(vec![2.0, 3.0, 4.0, 5.0]));
+    }
+
+    #[test]
+    fn ring_push_larger_than_capacity_drops_all_existing() {
+        let mut buf = VecDeque::from(vec![1.0, 2.0]);
+        push_with_drop_oldest(&mut buf, &[3.0, 4.0, 5.0, 6.0], 4);
+        // total = 6; overflow = 2; drop_n = 2 (the existing two);
+        // result keeps only the newest 4.
+        assert_eq!(buf, VecDeque::from(vec![3.0, 4.0, 5.0, 6.0]));
+    }
+
+    #[test]
+    fn ring_push_data_alone_exceeds_capacity() {
+        let mut buf = VecDeque::new();
+        push_with_drop_oldest(&mut buf, &[1.0, 2.0, 3.0, 4.0, 5.0], 3);
+        // overflow = 5, drop_n = min(5, 0) = 0; just appends — exceeds cap.
+        // This is the documented behaviour: drop oldest in *existing buf only*.
+        // (In practice the caller chunks small batches; this case isn't hit.)
+        assert_eq!(buf.len(), 5);
+    }
+
+    #[test]
+    fn clock_zero_consumed_is_zero() {
+        assert_eq!(audio_clock_us(0, 0, 48_000, 2), 0);
+    }
+
+    #[test]
+    fn clock_simple_one_second() {
+        // 48000 stereo samples = 96000 interleaved samples = 1 s
+        assert_eq!(audio_clock_us(96_000, 0, 48_000, 2), 1_000_000);
+    }
+
+    #[test]
+    fn clock_subtracts_output_latency() {
+        // 1 s written, 100 ms output latency → audible "now" = 900 ms
+        assert_eq!(audio_clock_us(96_000, 100_000, 48_000, 2), 900_000);
+    }
+
+    #[test]
+    fn clock_latency_larger_than_written_saturates_to_zero() {
+        // Just-started stream: tiny amount written, latency dominates.
+        assert_eq!(audio_clock_us(960, 1_000_000, 48_000, 2), 0);
+    }
+
+    #[test]
+    fn ring_cap_default_config_matches_5s_stereo_48k() {
+        let cfg = PlaybackConfig::default();
+        assert_eq!(ring_cap_samples(&cfg), 48_000 * 2 * 5);
     }
 }

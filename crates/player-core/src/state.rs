@@ -51,3 +51,56 @@ impl PlaybackState {
         self.volume.load(Ordering::Relaxed)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults() {
+        let s = PlaybackState::new();
+        assert!(!s.shutdown());
+        assert!(!s.paused());
+        assert_eq!(s.volume(), 100);
+    }
+
+    #[test]
+    fn toggle_pause_flips_and_returns_new() {
+        let s = PlaybackState::new();
+        assert!(s.toggle_pause());
+        assert!(s.paused());
+        assert!(!s.toggle_pause());
+        assert!(!s.paused());
+    }
+
+    #[test]
+    fn request_shutdown_is_sticky_until_reset() {
+        let s = PlaybackState::new();
+        s.request_shutdown();
+        assert!(s.shutdown());
+        s.reset();
+        assert!(!s.shutdown());
+    }
+
+    #[test]
+    fn reset_clears_pause_too() {
+        let s = PlaybackState::new();
+        s.toggle_pause();
+        s.request_shutdown();
+        s.reset();
+        assert!(!s.shutdown());
+        assert!(!s.paused());
+    }
+
+    #[test]
+    fn volume_clamps_to_100() {
+        let s = PlaybackState::new();
+        s.set_volume(150);
+        assert_eq!(s.volume(), 100);
+        s.set_volume(0);
+        assert_eq!(s.volume(), 0);
+        s.set_volume(42);
+        assert_eq!(s.volume(), 42);
+    }
+}
+

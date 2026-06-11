@@ -1,12 +1,11 @@
-use crate::video_player::{
+use crate::{
     audio_player::AudioPlayer,
+    config::PlaybackConfig,
     decoder::{hw::try_enable_hw_decoder, pts_to_us},
     error::{PlayerError, Result},
-    event::PlaybackEvent,
-    frame_buffer::Frame,
+    frame_buffer::{Frame, FrameBuffer},
     state::PlaybackState,
 };
-use tokio::sync::mpsc::UnboundedSender;
 use ffmpeg::{
     codec::context::Context,
     software::scaling::{Context as Scaler, Flags},
@@ -20,21 +19,14 @@ use std::{
 
 use ffmpeg::ffi::av_hwframe_transfer_data;
 
-/// Drop a video frame if it would be displayed more than this far past its
-/// PTS — i.e. the decoder is falling behind real-time.
-const LATE_DROP_US: i64 = 100_000;
-
-/// Max single sleep slice while pacing video — keeps shutdown / pause checks
-/// responsive even when waiting many frame periods.
-const PACE_SLICE: Duration = Duration::from_millis(20);
-
 pub fn video_decode_thread(
     rx: mpsc::Receiver<ffmpeg::Packet>,
     vparams: ffmpeg::codec::Parameters,
     vtb: ffmpeg::Rational,
-    events: UnboundedSender<PlaybackEvent>,
+    buffer: FrameBuffer,
     audio: Option<AudioPlayer>,
     state: Arc<PlaybackState>,
+    cfg: PlaybackConfig,
 ) -> Result<()> {
     // Build the decoder context, then attempt to attach a HW device BEFORE
     // calling avcodec_open2 (which happens inside `.open_as(codec)`).
@@ -89,13 +81,14 @@ pub fn video_decode_thread(
             &mut first_pts_us,
             &mut wall_anchor,
             vtb,
-            &events,
+            &buffer,
             out_pix,
             out_w,
             out_h,
             hw_pix_fmt,
             &audio,
             &state,
+            &cfg,
         );
     }
 
@@ -110,13 +103,14 @@ pub fn video_decode_thread(
         &mut first_pts_us,
         &mut wall_anchor,
         vtb,
-        &events,
+        &buffer,
         out_pix,
         out_w,
         out_h,
         hw_pix_fmt,
         &audio,
         &state,
+        &cfg,
     );
 
     Ok(())
@@ -131,13 +125,14 @@ fn drain_video(
     first_pts_us: &mut Option<u64>,
     wall_anchor: &mut Option<(Instant, u64)>,
     vtb: ffmpeg::Rational,
-    events: &UnboundedSender<PlaybackEvent>,
+    buffer: &FrameBuffer,
     out_pix: Pixel,
     out_w: u32,
     out_h: u32,
     hw_pix_fmt: Option<i32>,
     audio: &Option<AudioPlayer>,
     state: &Arc<PlaybackState>,
+    cfg: &PlaybackConfig,
 ) {
     while vdec.receive_frame(vyuv).is_ok() {
         if state.shutdown() {
@@ -204,18 +199,26 @@ fn drain_video(
 
         // Pace presentation against audio clock (or wall-clock fallback).
         // Drop frame if we're far past its display time.
-        if pace_video(audio, wall_anchor, ts_us, state) {
+        if pace_video(audio, wall_anchor, ts_us, state, cfg) {
             continue;
         }
 
         let plane = vout.data(0);
         let pixels: Arc<[u8]> = Vec::from(plane).into();
-        let _ = events.send(PlaybackEvent::Frame(Arc::new(Frame {
+        buffer.push(Arc::new(Frame {
             data: pixels,
             width: out_w,
             height: out_h,
             ts_us,
-        })));
+        }));
+
+        static FRAME_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = FRAME_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n.is_multiple_of(30) {
+            let clk = audio.as_ref().and_then(|a| a.clock_us()).unwrap_or(u64::MAX);
+            tracing::debug!(target: "video",
+                "pushed frame #{n} ts_us={ts_us} audio_clock_us={clk}");
+        }
     }
 }
 
@@ -227,6 +230,7 @@ fn pace_video(
     wall_anchor: &mut Option<(Instant, u64)>,
     ts_us: u64,
     state: &Arc<PlaybackState>,
+    cfg: &PlaybackConfig,
 ) -> bool {
     if let Some(ap) = audio.as_ref() {
         if ap.clock_us().is_some() {
@@ -240,18 +244,19 @@ fn pace_video(
                     if state.shutdown() {
                         return false;
                     }
-                    std::thread::sleep(PACE_SLICE);
+                    std::thread::sleep(cfg.pace_slice);
                 }
                 let now = ap.clock_us().unwrap_or(0) as i64;
                 let diff = ts_us as i64 - now;
                 if diff <= 0 {
-                    return -diff > LATE_DROP_US;
+                    return -diff > cfg.late_drop_us;
                 }
                 // Safety bail-out in case the audio clock stalls.
                 if wait_start.elapsed() > Duration::from_secs(2) {
+                    tracing::warn!(target: "video", "pace bailout: ts_us={ts_us} clock={now} diff_ms={}", diff / 1000);
                     return false;
                 }
-                let sleep_us = (diff as u64).min(PACE_SLICE.as_micros() as u64);
+                let sleep_us = (diff as u64).min(cfg.pace_slice.as_micros() as u64);
                 std::thread::sleep(Duration::from_micros(sleep_us));
             }
         }
@@ -269,7 +274,7 @@ fn pace_video(
     let elapsed = now.duration_since(start_inst);
     let target = Duration::from_micros(ts_us.saturating_sub(first_pts));
     if target > elapsed {
-        let sleep = (target - elapsed).min(PACE_SLICE);
+        let sleep = (target - elapsed).min(cfg.pace_slice);
         std::thread::sleep(sleep);
         // Loop until target reached or shutdown — keep responsive.
         while !state.shutdown() {
@@ -277,9 +282,9 @@ fn pace_video(
             if elapsed >= target {
                 break;
             }
-            std::thread::sleep((target - elapsed).min(PACE_SLICE));
+            std::thread::sleep((target - elapsed).min(cfg.pace_slice));
         }
-    } else if (elapsed - target).as_micros() as i64 > LATE_DROP_US {
+    } else if (elapsed - target).as_micros() as i64 > cfg.late_drop_us {
         return true;
     }
     false

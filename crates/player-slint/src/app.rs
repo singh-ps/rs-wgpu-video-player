@@ -1,4 +1,4 @@
-use crate::video_player::{PlaybackEvent, VideoPlayer};
+use player_core::{AudioStream, PlaybackEvent, VideoPlayer};
 use slint::{ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer};
 use std::{
     cell::RefCell,
@@ -35,7 +35,7 @@ struct Session {
     /// cpal output stream — must outlive the player; dropped here when the
     /// session is replaced.
     #[allow(dead_code)]
-    audio_stream: Option<cpal::Stream>,
+    audio_stream: Option<AudioStream>,
 }
 
 pub struct App {}
@@ -81,7 +81,7 @@ impl App {
                     rt.block_on(async { new_player.start_playback(&stream_url).await })
                 });
 
-                let mut rx = match start_res {
+                let mut events_rx = match start_res {
                     Ok(rx) => rx,
                     Err(e) => {
                         tracing::warn!(target: "app", "failed to start playback: {e:?}");
@@ -92,28 +92,59 @@ impl App {
                     }
                 };
 
+                let mut frame_rx = new_player.frame_buffer.subscribe();
                 let duration_secs_listener = Arc::new(Mutex::new(0.0_f64));
                 let app_weak_listener = app_weak.clone();
                 let listener = tokio::spawn(async move {
-                    while let Some(ev) = rx.recv().await {
-                        match ev {
-                            PlaybackEvent::Frame(frame) => {
+                    loop {
+                        tokio::select! {
+                            ev = events_rx.recv() => match ev {
+                                Some(PlaybackEvent::Duration(us)) => {
+                                    let secs = us as f64 / 1_000_000.0;
+                                    *lock(&duration_secs_listener) = secs;
+                                    let formatted = format_time(secs);
+                                    let app_weak_ui = app_weak_listener.clone();
+                                    let _ = app_weak_ui.upgrade_in_event_loop(move |ui| {
+                                        ui.set_total_duration(formatted.into());
+                                    });
+                                }
+                                Some(PlaybackEvent::Ended) => {
+                                    let app_weak_ui = app_weak_listener.clone();
+                                    let _ = app_weak_ui.upgrade_in_event_loop(move |ui| {
+                                        ui.set_status_text("Finished".into());
+                                        ui.set_is_playing(false);
+                                    });
+                                    break;
+                                }
+                                Some(PlaybackEvent::Error(msg)) => {
+                                    let app_weak_ui = app_weak_listener.clone();
+                                    let _ = app_weak_ui.upgrade_in_event_loop(move |ui| {
+                                        ui.set_status_text(format!("Error: {}", msg).into());
+                                        ui.set_is_playing(false);
+                                    });
+                                    break;
+                                }
+                                None => break,
+                            },
+                            changed = frame_rx.changed() => {
+                                if changed.is_err() {
+                                    continue;
+                                }
+                                let frame_opt = frame_rx.borrow_and_update().clone();
+                                let Some(frame) = frame_opt else { continue };
                                 let slint_buf = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
                                     &frame.data,
                                     frame.width,
                                     frame.height,
                                 );
-
                                 let elapsed_secs = frame.ts_us as f64 / 1_000_000.0;
                                 let elapsed_str = format_time(elapsed_secs);
-
                                 let total_secs = *lock(&duration_secs_listener);
                                 let progress = if total_secs > 0.0 {
                                     (elapsed_secs / total_secs).clamp(0.0, 1.0)
                                 } else {
                                     0.0
                                 };
-
                                 let app_weak_ui = app_weak_listener.clone();
                                 let _ = app_weak_ui.upgrade_in_event_loop(move |ui| {
                                     let slint_img = Image::from_rgba8(slint_buf);
@@ -121,31 +152,6 @@ impl App {
                                     ui.set_elapsed_time(elapsed_str.into());
                                     ui.set_timeline_progress(progress as f32);
                                 });
-                            }
-                            PlaybackEvent::Duration(us) => {
-                                let secs = us as f64 / 1_000_000.0;
-                                *lock(&duration_secs_listener) = secs;
-                                let formatted = format_time(secs);
-                                let app_weak_ui = app_weak_listener.clone();
-                                let _ = app_weak_ui.upgrade_in_event_loop(move |ui| {
-                                    ui.set_total_duration(formatted.into());
-                                });
-                            }
-                            PlaybackEvent::Ended => {
-                                let app_weak_ui = app_weak_listener.clone();
-                                let _ = app_weak_ui.upgrade_in_event_loop(move |ui| {
-                                    ui.set_status_text("Finished".into());
-                                    ui.set_is_playing(false);
-                                });
-                                break;
-                            }
-                            PlaybackEvent::Error(msg) => {
-                                let app_weak_ui = app_weak_listener.clone();
-                                let _ = app_weak_ui.upgrade_in_event_loop(move |ui| {
-                                    ui.set_status_text(format!("Error: {}", msg).into());
-                                    ui.set_is_playing(false);
-                                });
-                                break;
                             }
                         }
                     }
