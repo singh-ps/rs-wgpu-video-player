@@ -59,6 +59,35 @@ impl AudioPlayer {
         }
     }
 
+    /// Begin a seek: drop all queued PCM and suspend the clock. `clock_us`
+    /// returns `None` from here until post-seek samples actually play, so
+    /// video pacing falls back to wall-clock instead of comparing new frames
+    /// against the stale pre-seek position. Called from the demux thread
+    /// *before* any post-seek packet is dispatched.
+    pub fn begin_seek(&self) {
+        // Suspend first: the cpal callback checks `started` before advancing.
+        self.started.store(false, Ordering::Relaxed);
+        self.samples_consumed.store(0, Ordering::Relaxed);
+        let mut buf = match self.samples.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        buf.clear();
+    }
+
+    /// Re-seed the clock at `us` (normalized timeline). Called by the audio
+    /// decode thread with the PTS of the first post-seek frame, before pushing
+    /// its samples. The callback flips `started` back on once real samples
+    /// play, and the clock advances from this value — so A/V realign exactly
+    /// where the audio landed, not where the seek was requested.
+    pub fn resume_at_us(&self, us: u64) {
+        let samples = us
+            .saturating_mul(self.cfg.audio_sample_rate as u64)
+            .saturating_mul(self.cfg.audio_channels as u64)
+            / 1_000_000;
+        self.samples_consumed.store(samples, Ordering::Relaxed);
+    }
+
     /// Master clock: microseconds of audio audible at the speakers right now.
     /// Returns `None` before the stream has emitted any real samples.
     pub fn clock_us(&self) -> Option<u64> {

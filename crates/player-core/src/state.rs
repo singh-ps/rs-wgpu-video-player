@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// Shared flags read by the decoder threads, audio callback, and UI. Bundled so
 /// new shared state doesn't force edits across every signature in the player.
@@ -7,6 +7,10 @@ pub struct PlaybackState {
     pub paused: AtomicBool,
     /// Volume 0-100.
     pub volume: AtomicU32,
+    /// Seek generation. Demux bumps this on every seek; packets are tagged
+    /// with the epoch they were demuxed under, so decode threads can discard
+    /// stale pre-seek packets without decoding them.
+    pub epoch: AtomicU64,
 }
 
 impl Default for PlaybackState {
@@ -21,6 +25,7 @@ impl PlaybackState {
             shutdown: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             volume: AtomicU32::new(100),
+            epoch: AtomicU64::new(0),
         }
     }
 
@@ -49,6 +54,14 @@ impl PlaybackState {
     }
     pub fn volume(&self) -> u32 {
         self.volume.load(Ordering::Relaxed)
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+    /// Returns the new epoch.
+    pub fn bump_epoch(&self) -> u64 {
+        self.epoch.fetch_add(1, Ordering::AcqRel) + 1
     }
 }
 

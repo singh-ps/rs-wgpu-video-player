@@ -1,7 +1,7 @@
 use crate::{
     audio_player::AudioPlayer,
     config::PlaybackConfig,
-    decoder::{hw::try_enable_hw_decoder, pts_to_us},
+    decoder::{demux::TaggedPacket, hw::try_enable_hw_decoder, pts_to_us},
     error::{PlayerError, Result},
     frame_buffer::{Frame, FrameBuffer},
     state::PlaybackState,
@@ -20,7 +20,7 @@ use std::{
 use ffmpeg::ffi::av_hwframe_transfer_data;
 
 pub fn video_decode_thread(
-    rx: mpsc::Receiver<ffmpeg::Packet>,
+    rx: mpsc::Receiver<TaggedPacket>,
     vparams: ffmpeg::codec::Parameters,
     vtb: ffmpeg::Rational,
     buffer: FrameBuffer,
@@ -53,14 +53,28 @@ pub fn video_decode_thread(
     let mut vout = Video::empty();
 
     // Normalize PTS into a 0-based timeline so it can be compared with the
-    // audio sample-clock (also 0-based).
+    // audio sample-clock (also 0-based). NOT reset on seek — the timeline
+    // stays continuous so post-seek positions read as true stream positions.
     let mut first_pts_us: Option<u64> = None;
     // Wall-clock anchor used only as a fallback before audio clock is live.
     let mut wall_anchor: Option<(Instant, u64)> = None;
+    // Seek epoch of the packets currently being decoded.
+    let mut epoch: u64 = 0;
 
-    for packet in rx {
+    for (pkt_epoch, packet) in rx {
         if state.shutdown() {
             break;
+        }
+        // Stale pre-seek packet still in the queue: drain without decoding.
+        if pkt_epoch < state.epoch() {
+            continue;
+        }
+        if pkt_epoch != epoch {
+            // First packet after a seek: discard decoder-internal state so we
+            // start clean from the new keyframe.
+            vdec.flush();
+            wall_anchor = None;
+            epoch = pkt_epoch;
         }
         while state.paused() {
             if state.shutdown() {
@@ -89,6 +103,7 @@ pub fn video_decode_thread(
             &audio,
             &state,
             &cfg,
+            epoch,
         );
     }
 
@@ -111,6 +126,7 @@ pub fn video_decode_thread(
         &audio,
         &state,
         &cfg,
+        epoch,
     );
 
     Ok(())
@@ -133,6 +149,7 @@ fn drain_video(
     audio: &Option<AudioPlayer>,
     state: &Arc<PlaybackState>,
     cfg: &PlaybackConfig,
+    epoch: u64,
 ) {
     while vdec.receive_frame(vyuv).is_ok() {
         if state.shutdown() {
@@ -198,8 +215,9 @@ fn drain_video(
         let ts_us = abs_pts.saturating_sub(first);
 
         // Pace presentation against audio clock (or wall-clock fallback).
-        // Drop frame if we're far past its display time.
-        if pace_video(audio, wall_anchor, ts_us, state, cfg) {
+        // Drop frame if we're far past its display time or a seek superseded
+        // this epoch while we were waiting.
+        if pace_video(audio, wall_anchor, ts_us, state, cfg, epoch) {
             continue;
         }
 
@@ -224,13 +242,16 @@ fn drain_video(
 
 /// Block until the frame's presentation time arrives, paced by the audio
 /// master clock when available, falling back to wall-clock relative to the
-/// first frame. Returns `true` if the frame is so late it should be dropped.
+/// first frame. Returns `true` if the frame should be dropped — because it's
+/// far past its display time, or because a seek invalidated its epoch while
+/// we were waiting.
 fn pace_video(
     audio: &Option<AudioPlayer>,
     wall_anchor: &mut Option<(Instant, u64)>,
     ts_us: u64,
     state: &Arc<PlaybackState>,
     cfg: &PlaybackConfig,
+    epoch: u64,
 ) -> bool {
     if let Some(ap) = audio.as_ref() {
         if ap.clock_us().is_some() {
@@ -240,13 +261,28 @@ fn pace_video(
                 if state.shutdown() {
                     return false;
                 }
+                if state.epoch() != epoch {
+                    return true; // seeked away while waiting — drop this frame
+                }
                 while state.paused() {
                     if state.shutdown() {
                         return false;
                     }
+                    if state.epoch() != epoch {
+                        return true;
+                    }
                     std::thread::sleep(cfg.pace_slice);
                 }
-                let now = ap.clock_us().unwrap_or(0) as i64;
+                // Clock can go None mid-wait (seek in progress) — fall through
+                // to the epoch check next iteration rather than treating the
+                // frame as infinitely early.
+                let now = match ap.clock_us() {
+                    Some(c) => c as i64,
+                    None => {
+                        std::thread::sleep(cfg.pace_slice);
+                        continue;
+                    }
+                };
                 let diff = ts_us as i64 - now;
                 if diff <= 0 {
                     return -diff > cfg.late_drop_us;
@@ -278,6 +314,9 @@ fn pace_video(
         std::thread::sleep(sleep);
         // Loop until target reached or shutdown — keep responsive.
         while !state.shutdown() {
+            if state.epoch() != epoch {
+                return true;
+            }
             let elapsed = Instant::now().duration_since(start_inst);
             if elapsed >= target {
                 break;

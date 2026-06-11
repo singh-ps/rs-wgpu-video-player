@@ -16,6 +16,16 @@ use ffmpeg_next as ffmpeg;
 use std::sync::{mpsc, Arc};
 use tokio::sync::mpsc::UnboundedSender;
 
+use demux::TaggedPacket;
+
+/// Commands the UI can send into the running demux loop.
+#[derive(Debug)]
+pub enum DemuxCommand {
+    /// Seek to this position in microseconds on the 0-based UI timeline.
+    Seek(u64),
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn loop_decoder(
     input: String,
     buffer: FrameBuffer,
@@ -23,6 +33,7 @@ pub fn loop_decoder(
     audio: Option<AudioPlayer>,
     state: Arc<PlaybackState>,
     cfg: PlaybackConfig,
+    cmd_rx: mpsc::Receiver<DemuxCommand>,
 ) -> Result<()> {
     // Bound stream probing. Without this, avformat_find_stream_info on an HLS
     // master playlist downloads sample segments from EVERY bitrate variant in
@@ -50,19 +61,19 @@ pub fn loop_decoder(
         (vstream.index(), vstream.parameters(), vstream.time_base())
     };
 
-    let (aindex, aparams) = match (audio.as_ref(), ictx.streams().best(Type::Audio)) {
-        (Some(_), Some(s)) => (s.index(), Some(s.parameters())),
+    let (aindex, aparams, atb) = match (audio.as_ref(), ictx.streams().best(Type::Audio)) {
+        (Some(_), Some(s)) => (s.index(), Some(s.parameters()), s.time_base()),
         (Some(_), None) => {
             tracing::info!(target: "decoder", "no audio stream in source — audio disabled");
-            (usize::MAX, None)
+            (usize::MAX, None, ffmpeg::Rational(0, 1))
         }
-        _ => (usize::MAX, None),
+        _ => (usize::MAX, None, ffmpeg::Rational(0, 1)),
     };
 
     // ── Channels: demux → decode threads ─────────────────────────────────────
-    let (vtx, vrx) = mpsc::sync_channel::<ffmpeg::Packet>(cfg.video_pkt_queue);
+    let (vtx, vrx) = mpsc::sync_channel::<TaggedPacket>(cfg.video_pkt_queue);
     let (atx_opt, arx_opt) = if aparams.is_some() {
-        let (a, b) = mpsc::sync_channel::<ffmpeg::Packet>(cfg.audio_pkt_queue);
+        let (a, b) = mpsc::sync_channel::<TaggedPacket>(cfg.audio_pkt_queue);
         (Some(a), Some(b))
     } else {
         (None, None)
@@ -86,7 +97,8 @@ pub fn loop_decoder(
         (Some(arx), Some(ap_params), Some(ap)) => {
             let a_state = state.clone();
             Some(std::thread::spawn(move || {
-                if let Err(e) = audio::audio_decode_thread(arx, ap_params, ap, a_state, cfg) {
+                if let Err(e) = audio::audio_decode_thread(arx, ap_params, atb, ap, a_state, cfg)
+                {
                     tracing::warn!(target: "audio", "thread error: {e}");
                 }
             }))
@@ -104,6 +116,7 @@ pub fn loop_decoder(
         &audio,
         &state,
         &cfg,
+        &cmd_rx,
     );
 
     drop(vtx);

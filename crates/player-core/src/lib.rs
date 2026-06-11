@@ -12,7 +12,7 @@ mod config;
 pub use config::PlaybackConfig;
 
 mod decoder;
-use decoder::loop_decoder;
+use decoder::{loop_decoder, DemuxCommand};
 
 mod error;
 pub use error::{PlayerError, Result};
@@ -32,6 +32,8 @@ pub struct VideoPlayer {
     is_initialized: bool,
     state: Arc<PlaybackState>,
     cfg: PlaybackConfig,
+    /// Live while a playback session runs; commands go to the demux loop.
+    cmd_tx: Option<std::sync::mpsc::Sender<DemuxCommand>>,
 }
 
 impl VideoPlayer {
@@ -63,6 +65,7 @@ impl VideoPlayer {
             is_initialized: false,
             state,
             cfg,
+            cmd_tx: None,
         };
         (player, audio_stream)
     }
@@ -76,6 +79,8 @@ impl VideoPlayer {
         self.is_initialized = true;
 
         let (tx, rx) = mpsc::unbounded_channel::<PlaybackEvent>();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<DemuxCommand>();
+        self.cmd_tx = Some(cmd_tx);
 
         let audio = self.audio_player.clone();
         let state = self.state.clone();
@@ -83,7 +88,9 @@ impl VideoPlayer {
         let buffer = self.frame_buffer.clone();
         let dec_url = url.to_string();
         tokio::task::spawn_blocking(move || {
-            if let Err(e) = loop_decoder(dec_url, buffer, tx.clone(), Some(audio), state, cfg) {
+            if let Err(e) =
+                loop_decoder(dec_url, buffer, tx.clone(), Some(audio), state, cfg, cmd_rx)
+            {
                 let _ = tx.send(PlaybackEvent::Error(format!("{e}")));
             }
         });
@@ -95,8 +102,18 @@ impl VideoPlayer {
         if !self.is_initialized {
             return;
         }
+        self.cmd_tx = None;
         self.state.request_shutdown();
         self.is_initialized = false;
+    }
+
+    /// Seek to `us` on the 0-based playback timeline. No-op when nothing is
+    /// playing. The demux loop picks the request up between packets; rapid
+    /// repeated calls (slider scrubbing) coalesce to the most recent target.
+    pub fn seek_to_us(&self, us: u64) {
+        if let Some(tx) = &self.cmd_tx {
+            let _ = tx.send(DemuxCommand::Seek(us));
+        }
     }
 
     pub fn toggle_pause(&self) -> bool {

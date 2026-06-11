@@ -47,6 +47,10 @@ impl App {
 
         let session: Rc<RefCell<Option<Session>>> = Rc::new(RefCell::new(None));
 
+        // Duration of the current stream in seconds; written by the listener
+        // task (Duration event), read by the frame handler and seek callback.
+        let duration_secs: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
+
         let stop_playback = {
             let session = session.clone();
             let app_weak = app.as_weak();
@@ -71,8 +75,10 @@ impl App {
             let session = session.clone();
             let app_weak = app.as_weak();
             let stop_playback_clone = stop_playback.clone();
+            let duration_secs = duration_secs.clone();
             move |stream_url: String| {
                 stop_playback_clone();
+                *lock(&duration_secs) = 0.0;
 
                 let (mut new_player, audio_stream) = VideoPlayer::new();
 
@@ -93,7 +99,7 @@ impl App {
                 };
 
                 let mut frame_rx = new_player.frame_buffer.subscribe();
-                let duration_secs_listener = Arc::new(Mutex::new(0.0_f64));
+                let duration_secs_listener = duration_secs.clone();
                 let app_weak_listener = app_weak.clone();
                 let listener = tokio::spawn(async move {
                     loop {
@@ -201,6 +207,20 @@ impl App {
             let vol = (val.clamp(0.0, 1.0) * 100.0).round() as u32;
             if let Some(ref s) = *session_clone.borrow() {
                 s.player.set_volume(vol);
+            }
+        });
+
+        let session_clone = session.clone();
+        let duration_secs_seek = duration_secs.clone();
+        app.on_seek_progress(move |fraction| {
+            let total = *lock(&duration_secs_seek);
+            // Live streams / unknown duration: nothing sensible to seek to.
+            if total <= 0.0 {
+                return;
+            }
+            let target_us = (fraction.clamp(0.0, 1.0) as f64 * total * 1_000_000.0) as u64;
+            if let Some(ref s) = *session_clone.borrow() {
+                s.player.seek_to_us(target_us);
             }
         });
 
