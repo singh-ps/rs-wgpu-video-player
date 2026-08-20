@@ -27,7 +27,11 @@ mod state;
 use state::PlaybackState;
 
 pub struct VideoPlayer {
-    pub audio_player: AudioPlayer,
+    /// `None` when no audio output could be opened; playback then runs
+    /// video-only, paced by the wall clock. Never hold an `AudioPlayer`
+    /// without a live output stream — nothing would drain its sample ring and
+    /// the demux loop's audio backpressure would block forever.
+    pub audio_player: Option<AudioPlayer>,
     pub frame_buffer: FrameBuffer,
     is_initialized: bool,
     state: Arc<PlaybackState>,
@@ -48,14 +52,15 @@ impl VideoPlayer {
         let state = Arc::new(PlaybackState::new());
         let audio_player = AudioPlayer::new(state.clone(), cfg);
 
-        let audio_stream = match audio_player.start_stream() {
+        let (audio_player, audio_stream) = match audio_player.start_stream() {
             Ok(s) => {
                 tracing::info!(target: "audio", "cpal audio stream started");
-                Some(s)
+                (Some(audio_player), Some(s))
             }
             Err(e) => {
-                tracing::warn!(target: "audio", "failed to open audio output: {e}");
-                None
+                tracing::warn!(target: "audio",
+                    "failed to open audio output: {e} — playing video only");
+                (None, None)
             }
         };
 
@@ -89,7 +94,7 @@ impl VideoPlayer {
         let dec_url = url.to_string();
         tokio::task::spawn_blocking(move || {
             if let Err(e) =
-                loop_decoder(dec_url, buffer, tx.clone(), Some(audio), state, cfg, cmd_rx)
+                loop_decoder(dec_url, buffer, tx.clone(), audio, state, cfg, cmd_rx)
             {
                 let _ = tx.send(PlaybackEvent::Error(format!("{e}")));
             }

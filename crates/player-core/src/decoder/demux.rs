@@ -14,6 +14,13 @@ use std::{
 /// without decoding stale data.
 pub type TaggedPacket = (u64, ffmpeg::Packet);
 
+/// How long the sample ring may sit above the backpressure threshold without
+/// draining before we conclude the output stream is dead and stop throttling.
+/// Must exceed the worst healthy flat period: the ring can hold at most
+/// (cap - demux_ahead) seconds above the threshold, and that drains in
+/// realtime once the in-flight packets are consumed.
+const AUDIO_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_demux(
     ictx: &mut ffmpeg::format::context::Input,
@@ -29,6 +36,10 @@ pub fn run_demux(
     let demux_ahead_samples = (cfg.audio_sample_rate as f32
         * cfg.audio_channels as f32
         * cfg.demux_ahead_secs) as usize;
+
+    // Cleared for the rest of the session if the sample ring ever stops
+    // draining; see `wait_for_audio_room`.
+    let mut throttle_audio = true;
 
     // Container start offset (µs). The UI timeline is 0-based; seek targets
     // arrive 0-based and must be shifted onto the container's timeline.
@@ -80,7 +91,7 @@ pub fn run_demux(
                     // is already well-stocked, wait. This indirectly paces
                     // demuxing of further video packets via packet interleave
                     // order in the container.
-                    wait_for_audio_room(audio, state, demux_ahead_samples);
+                    wait_for_audio_room(audio, state, demux_ahead_samples, &mut throttle_audio);
                     if state.shutdown() {
                         break 'session;
                     }
@@ -133,18 +144,25 @@ fn poll_seek(cmd_rx: &mpsc::Receiver<DemuxCommand>) -> Option<u64> {
 }
 
 /// Sleep the demux loop while the audio sample ring is already well-stocked.
-/// No-op when audio is not configured / not yet started.
+/// No-op when audio is not configured, or once `throttle` has been switched
+/// off by a stall.
+///
+/// Only the ring *draining* proves the output stream is alive. If it stops
+/// draining, waiting here would block demuxing — and therefore video — for
+/// the rest of the session, so we give up on audio backpressure entirely and
+/// let the ring's own drop-oldest policy bound memory.
 fn wait_for_audio_room(
     audio: &Option<AudioPlayer>,
     state: &Arc<PlaybackState>,
     demux_ahead_samples: usize,
+    throttle: &mut bool,
 ) {
     let ap = match audio.as_ref() {
-        Some(a) => a,
-        None => return,
+        Some(a) if *throttle => a,
+        _ => return,
     };
-    let waited_start = std::time::Instant::now();
-    let mut warned = false;
+    let mut last_queued = usize::MAX;
+    let mut stall_since: Option<std::time::Instant> = None;
     loop {
         if state.shutdown() {
             return;
@@ -153,14 +171,23 @@ fn wait_for_audio_room(
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
-        if ap.queued_samples() <= demux_ahead_samples {
+        let queued = ap.queued_samples();
+        if queued <= demux_ahead_samples {
             return;
         }
-        if !warned && waited_start.elapsed() > Duration::from_secs(3) {
-            tracing::warn!(target: "demux",
-                "audio backpressure stuck >3s, queued={} threshold={}",
-                ap.queued_samples(), demux_ahead_samples);
-            warned = true;
+        if queued < last_queued {
+            last_queued = queued;
+            stall_since = None;
+        } else {
+            let since = *stall_since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() > AUDIO_STALL_TIMEOUT {
+                tracing::warn!(target: "demux",
+                    "audio ring not draining for {:?} (queued={queued}, threshold={demux_ahead_samples}) \
+                     — output stream appears dead, disabling audio backpressure",
+                    AUDIO_STALL_TIMEOUT);
+                *throttle = false;
+                return;
+            }
         }
         std::thread::sleep(Duration::from_millis(10));
     }
