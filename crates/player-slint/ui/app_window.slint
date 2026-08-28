@@ -79,30 +79,6 @@ component PlaybackSlider inherits Rectangle {
     }
 }
 
-// Display-only progress bar. No seeking — playback engine has no seek path.
-component ProgressBar inherits Rectangle {
-    in property <float> value: 0.0; // 0.0 to 1.0
-
-    height: 16px;
-    background: transparent;
-
-    Rectangle {
-        y: (root.height - self.height) / 2;
-        height: 6px;
-        width: 100%;
-        background: #27272a;
-        border-radius: 3px;
-
-        Rectangle {
-            x: 0px;
-            height: 100%;
-            width: root.value * parent.width;
-            background: @linear-gradient(90deg, #00ffcc 0%, #0099ff 100%);
-            border-radius: 3px;
-        }
-    }
-}
-
 export component AppWindow inherits Window {
     title: "Video Player";
     width: 1280px;
@@ -122,6 +98,7 @@ export component AppWindow inherits Window {
     callback stop-clicked();
     callback load-url-clicked(string);
     callback volume-changed(float);
+    callback seek-progress(float); // 0.0 to 1.0 of total duration
 
     VerticalLayout {
         padding: 16px;
@@ -221,9 +198,13 @@ export component AppWindow inherits Window {
                         clicked => { root.stop-clicked(); }
                     }
 
-                    // Read-only progress bar
-                    ProgressBar {
+                    // Seekable timeline
+                    PlaybackSlider {
                         value: root.timeline-progress;
+                        seek(val) => {
+                            root.timeline-progress = val;
+                            root.seek-progress(val);
+                        }
                     }
 
                     // Timestamp Display
