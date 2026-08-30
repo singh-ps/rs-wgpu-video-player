@@ -1,6 +1,5 @@
 use crate::{
-    audio_player::AudioPlayer, config::PlaybackConfig, decoder::DemuxCommand,
-    state::PlaybackState,
+    audio_player::AudioPlayer, config::PlaybackConfig, decoder::DemuxCommand, state::PlaybackState,
 };
 use ffmpeg_next as ffmpeg;
 use std::{
@@ -33,9 +32,8 @@ pub fn run_demux(
     cfg: &PlaybackConfig,
     cmd_rx: &mpsc::Receiver<DemuxCommand>,
 ) {
-    let demux_ahead_samples = (cfg.audio_sample_rate as f32
-        * cfg.audio_channels as f32
-        * cfg.demux_ahead_secs) as usize;
+    let demux_ahead_samples =
+        (cfg.audio_sample_rate as f32 * cfg.audio_channels as f32 * cfg.demux_ahead_secs) as usize;
 
     // Cleared for the rest of the session if the sample ring ever stops
     // draining; see `wait_for_audio_room`.

@@ -225,8 +225,12 @@ fn drain_video(
         // allocated with 32-byte row alignment — so whenever `out_w * 4` is
         // not a multiple of 32 the rows carry padding the consumer knows
         // nothing about. Pack to a tight `out_w * 4` stride here.
-        let Some(pixels) = pack_rows(vout.data(0), vout.stride(0), out_w as usize * 4, out_h as usize)
-        else {
+        let Some(pixels) = pack_rows(
+            vout.data(0),
+            vout.stride(0),
+            out_w as usize * 4,
+            out_h as usize,
+        ) else {
             tracing::warn!(target: "video",
                 "short frame plane: stride={} height={out_h}", vout.stride(0));
             continue;
@@ -242,7 +246,10 @@ fn drain_video(
         static FRAME_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = FRAME_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if n.is_multiple_of(30) {
-            let clk = audio.as_ref().and_then(|a| a.clock_us()).unwrap_or(u64::MAX);
+            let clk = audio
+                .as_ref()
+                .and_then(|a| a.clock_us())
+                .unwrap_or(u64::MAX);
             tracing::debug!(target: "video",
                 "pushed frame #{n} ts_us={ts_us} audio_clock_us={clk}");
         }
@@ -372,7 +379,10 @@ mod tests {
             1, 2, 3, 4, 0, 0, //
             5, 6, 7, 8, 0, 0, //
         ];
-        assert_eq!(pack_rows(&plane, 6, 4, 2), Some(vec![1, 2, 3, 4, 5, 6, 7, 8]));
+        assert_eq!(
+            pack_rows(&plane, 6, 4, 2),
+            Some(vec![1, 2, 3, 4, 5, 6, 7, 8])
+        );
     }
 
     #[test]

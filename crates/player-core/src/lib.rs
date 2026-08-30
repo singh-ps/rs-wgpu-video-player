@@ -93,9 +93,7 @@ impl VideoPlayer {
         let buffer = self.frame_buffer.clone();
         let dec_url = url.to_string();
         tokio::task::spawn_blocking(move || {
-            if let Err(e) =
-                loop_decoder(dec_url, buffer, tx.clone(), audio, state, cfg, cmd_rx)
-            {
+            if let Err(e) = loop_decoder(dec_url, buffer, tx.clone(), audio, state, cfg, cmd_rx) {
                 let _ = tx.send(PlaybackEvent::Error(format!("{e}")));
             }
         });
