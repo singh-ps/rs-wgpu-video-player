@@ -166,6 +166,12 @@ fn wait_for_audio_room(
             return;
         }
         if state.paused() {
+            // The callback emits silence while paused, so the ring cannot
+            // drain: a pause is not evidence of a dead output stream. Forget
+            // any stall in progress, otherwise a pause longer than
+            // AUDIO_STALL_TIMEOUT trips the detector the moment we resume.
+            last_queued = usize::MAX;
+            stall_since = None;
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
