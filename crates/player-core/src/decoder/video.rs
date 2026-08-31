@@ -231,7 +231,9 @@ fn drain_video(
             out_w as usize * 4,
             out_h as usize,
         ) else {
-            tracing::warn!(target: "video",
+            // Unreachable given ffmpeg's data() length contract; debug so a
+            // genuinely malformed plane can't spam a line per frame.
+            tracing::debug!(target: "video",
                 "short frame plane: stride={} height={out_h}", vout.stride(0));
             continue;
         };
@@ -403,11 +405,45 @@ mod tests {
         assert_eq!(pack_rows(&plane, 2, 4, 2), None);
     }
 
+    /// Row stride ffmpeg produces for `width` RGBA pixels: `av_frame_get_buffer`
+    /// aligns rows to 32 bytes.
+    fn aligned_stride(width: usize) -> usize {
+        (width * 4).div_ceil(32) * 32
+    }
+
     #[test]
-    fn rgba_1920_needs_no_repacking_but_854_does() {
-        // av_frame_get_buffer aligns rows to 32 bytes.
-        let align = |row: usize| row.div_ceil(32) * 32;
-        assert_eq!(align(1920 * 4), 1920 * 4); // safe today
-        assert_ne!(align(854 * 4), 854 * 4); // sheared before this fix
+    fn rgba_854_padding_is_stripped_at_real_alignment() {
+        // 854 * 4 = 3416, which rounds up to 3424 — 8 pad bytes per row. This
+        // is the width that sheared before the fix.
+        let (w, h) = (854usize, 4usize);
+        let stride = aligned_stride(w);
+        assert_ne!(stride, w * 4, "854 must actually be padded");
+
+        // Fill each row with its own index, leave the padding as 0xFF so any
+        // leakage is visible.
+        let mut plane = vec![0xFFu8; stride * h];
+        for (i, row) in plane.chunks_exact_mut(stride).enumerate() {
+            row[..w * 4].fill(i as u8);
+        }
+
+        let packed = pack_rows(&plane, stride, w * 4, h).expect("plane is long enough");
+        assert_eq!(packed.len(), w * 4 * h);
+        for (i, row) in packed.chunks_exact(w * 4).enumerate() {
+            assert!(
+                row.iter().all(|&b| b == i as u8),
+                "row {i} picked up padding or a neighbouring row"
+            );
+        }
+    }
+
+    #[test]
+    fn rgba_1920_takes_the_unpadded_fast_path() {
+        let (w, h) = (1920usize, 2usize);
+        let stride = aligned_stride(w);
+        assert_eq!(stride, w * 4, "1920 was already aligned");
+
+        let plane: Vec<u8> = (0..stride * h).map(|i| i as u8).collect();
+        let packed = pack_rows(&plane, stride, w * 4, h).expect("plane is long enough");
+        assert_eq!(packed, plane, "aligned planes must be copied verbatim");
     }
 }
