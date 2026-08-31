@@ -81,7 +81,14 @@ pub fn audio_decode_thread(
             continue;
         }
         drain_audio(
-            &mut dec, &mut resampler, &mut frame, &player, &state, &cfg, atb, &mut seed,
+            &mut dec,
+            &mut resampler,
+            &mut frame,
+            &player,
+            &state,
+            &cfg,
+            atb,
+            &mut seed,
         );
     }
 
@@ -89,7 +96,14 @@ pub fn audio_decode_thread(
         tracing::warn!(target: "audio", "send_eof error: {e}");
     }
     drain_audio(
-        &mut dec, &mut resampler, &mut frame, &player, &state, &cfg, atb, &mut seed,
+        &mut dec,
+        &mut resampler,
+        &mut frame,
+        &player,
+        &state,
+        &cfg,
+        atb,
+        &mut seed,
     );
     flush_resampler(&mut resampler, &player, &cfg);
     Ok(())
@@ -174,7 +188,9 @@ fn push_resampled(resampled: &AudioFrame, player: &AudioPlayer, cfg: &PlaybackCo
     if n_per_ch == 0 {
         return;
     }
-    let n_samples = n_per_ch.checked_mul(cfg.audio_channels as usize).unwrap_or(0);
+    let n_samples = n_per_ch
+        .checked_mul(cfg.audio_channels as usize)
+        .unwrap_or(0);
     if n_samples == 0 {
         return;
     }

@@ -116,4 +116,3 @@ mod tests {
         assert_eq!(s.volume(), 42);
     }
 }
-

@@ -1,6 +1,5 @@
 use crate::{
-    audio_player::AudioPlayer, config::PlaybackConfig, decoder::DemuxCommand,
-    state::PlaybackState,
+    audio_player::AudioPlayer, config::PlaybackConfig, decoder::DemuxCommand, state::PlaybackState,
 };
 use ffmpeg_next as ffmpeg;
 use std::{
@@ -26,9 +25,12 @@ pub fn run_demux(
     cfg: &PlaybackConfig,
     cmd_rx: &mpsc::Receiver<DemuxCommand>,
 ) {
-    let demux_ahead_samples = (cfg.audio_sample_rate as f32
-        * cfg.audio_channels as f32
-        * cfg.demux_ahead_secs) as usize;
+    let demux_ahead_samples =
+        (cfg.audio_sample_rate as f32 * cfg.audio_channels as f32 * cfg.demux_ahead_secs) as usize;
+
+    // Cleared for the rest of the session if the sample ring ever stops
+    // draining; see `wait_for_audio_room`.
+    let mut throttle_audio = true;
 
     // Container start offset (µs). The UI timeline is 0-based; seek targets
     // arrive 0-based and must be shifted onto the container's timeline.
@@ -80,7 +82,13 @@ pub fn run_demux(
                     // is already well-stocked, wait. This indirectly paces
                     // demuxing of further video packets via packet interleave
                     // order in the container.
-                    wait_for_audio_room(audio, state, demux_ahead_samples);
+                    wait_for_audio_room(
+                        audio,
+                        state,
+                        demux_ahead_samples,
+                        cfg.audio_stall_timeout(),
+                        &mut throttle_audio,
+                    );
                     if state.shutdown() {
                         break 'session;
                     }
@@ -133,34 +141,61 @@ fn poll_seek(cmd_rx: &mpsc::Receiver<DemuxCommand>) -> Option<u64> {
 }
 
 /// Sleep the demux loop while the audio sample ring is already well-stocked.
-/// No-op when audio is not configured / not yet started.
+/// No-op when audio is not configured, or once `throttle` has been switched
+/// off by a stall.
+///
+/// `stall_timeout` comes from [`PlaybackConfig::audio_stall_timeout`], which
+/// derives it from the ring capacity so it can't fall below the worst healthy
+/// flat period.
+///
+/// Only the ring *draining* proves the output stream is alive. If it stops
+/// draining, waiting here would block demuxing — and therefore video — for
+/// the rest of the session, so we give up on audio backpressure entirely and
+/// let the ring's own drop-oldest policy bound memory.
 fn wait_for_audio_room(
     audio: &Option<AudioPlayer>,
     state: &Arc<PlaybackState>,
     demux_ahead_samples: usize,
+    stall_timeout: Duration,
+    throttle: &mut bool,
 ) {
     let ap = match audio.as_ref() {
-        Some(a) => a,
-        None => return,
+        Some(a) if *throttle => a,
+        _ => return,
     };
-    let waited_start = std::time::Instant::now();
-    let mut warned = false;
+    let mut last_queued = usize::MAX;
+    let mut stall_since: Option<std::time::Instant> = None;
     loop {
         if state.shutdown() {
             return;
         }
         if state.paused() {
+            // The callback emits silence while paused, so the ring cannot
+            // drain: a pause is not evidence of a dead output stream. Forget
+            // any stall in progress, otherwise a pause longer than
+            // the stall timeout trips the detector the moment we resume.
+            last_queued = usize::MAX;
+            stall_since = None;
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
-        if ap.queued_samples() <= demux_ahead_samples {
+        let queued = ap.queued_samples();
+        if queued <= demux_ahead_samples {
             return;
         }
-        if !warned && waited_start.elapsed() > Duration::from_secs(3) {
-            tracing::warn!(target: "demux",
-                "audio backpressure stuck >3s, queued={} threshold={}",
-                ap.queued_samples(), demux_ahead_samples);
-            warned = true;
+        if queued < last_queued {
+            last_queued = queued;
+            stall_since = None;
+        } else {
+            let since = *stall_since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() > stall_timeout {
+                tracing::warn!(target: "demux",
+                    "audio ring not draining for {stall_timeout:?} (queued={queued}, \
+                     threshold={demux_ahead_samples}) — output stream appears dead, \
+                     disabling audio backpressure");
+                *throttle = false;
+                return;
+            }
         }
         std::thread::sleep(Duration::from_millis(10));
     }

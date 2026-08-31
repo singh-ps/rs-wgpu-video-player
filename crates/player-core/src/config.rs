@@ -18,6 +18,9 @@ pub struct PlaybackConfig {
     /// Demux throttles audio dispatch when the ring exceeds this many seconds
     /// of buffered audio. Bounds pre-buffer; doesn't affect video.
     pub demux_ahead_secs: f32,
+    /// Slack added to the worst healthy flat period when deciding the audio
+    /// output stream is dead; see [`PlaybackConfig::audio_stall_timeout`].
+    pub audio_stall_margin_secs: f32,
     /// Drop a video frame if it would display this far past its PTS.
     pub late_drop_us: i64,
     /// Max single sleep slice while pacing video; keeps shutdown/pause checks
@@ -31,6 +34,22 @@ pub struct PlaybackConfig {
     pub audio_channels: u16,
 }
 
+impl PlaybackConfig {
+    /// How long the sample ring may sit above the backpressure threshold
+    /// without draining before demux concludes the output stream is dead and
+    /// stops throttling.
+    ///
+    /// Derived rather than stored: the ring can hold at most
+    /// `sample_ring_cap_secs - demux_ahead_secs` seconds above the threshold,
+    /// and that drains in realtime once the in-flight packets are consumed —
+    /// so a fixed timeout would start reporting healthy playback as a stall
+    /// the moment the ring capacity was raised past it.
+    pub fn audio_stall_timeout(&self) -> Duration {
+        let headroom = (self.sample_ring_cap_secs - self.demux_ahead_secs).max(0.0);
+        Duration::from_secs_f32(headroom + self.audio_stall_margin_secs.max(0.0))
+    }
+}
+
 impl Default for PlaybackConfig {
     fn default() -> Self {
         Self {
@@ -38,11 +57,50 @@ impl Default for PlaybackConfig {
             audio_pkt_queue: 1024,
             sample_ring_cap_secs: 5.0,
             demux_ahead_secs: 3.0,
+            audio_stall_margin_secs: 3.0,
             late_drop_us: 100_000,
             pace_slice: Duration::from_millis(20),
             max_audio_latency_us: 200_000,
             audio_sample_rate: 48_000,
             audio_channels: 2,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PlaybackConfig;
+    use std::time::Duration;
+
+    #[test]
+    fn default_stall_timeout_is_five_seconds() {
+        assert_eq!(
+            PlaybackConfig::default().audio_stall_timeout(),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn stall_timeout_tracks_ring_capacity() {
+        // The whole point: a bigger ring means a longer healthy flat period,
+        // so the timeout has to grow with it or healthy playback reads as a
+        // stall.
+        let cfg = PlaybackConfig {
+            sample_ring_cap_secs: 20.0,
+            ..PlaybackConfig::default()
+        };
+        assert_eq!(cfg.audio_stall_timeout(), Duration::from_secs(20));
+    }
+
+    #[test]
+    fn stall_timeout_survives_inverted_config() {
+        // demux_ahead above the ring cap is nonsensical, but must not panic
+        // in Duration::from_secs_f32 via a negative value.
+        let cfg = PlaybackConfig {
+            sample_ring_cap_secs: 1.0,
+            demux_ahead_secs: 9.0,
+            ..PlaybackConfig::default()
+        };
+        assert_eq!(cfg.audio_stall_timeout(), Duration::from_secs(3));
     }
 }

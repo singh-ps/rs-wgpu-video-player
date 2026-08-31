@@ -47,8 +47,7 @@ pub fn loop_decoder(
     // Emit duration if the container knows it. Avoids a second `format::input`
     // call (which on HLS would open a parallel set of segment downloads).
     if ictx.duration() > 0 {
-        let dur_us =
-            (ictx.duration() as i128 * 1_000_000i128 / AV_TIME_BASE as i128) as u64;
+        let dur_us = (ictx.duration() as i128 * 1_000_000i128 / AV_TIME_BASE as i128) as u64;
         let _ = events.send(PlaybackEvent::Duration(dur_us));
     }
 
@@ -97,8 +96,7 @@ pub fn loop_decoder(
         (Some(arx), Some(ap_params), Some(ap)) => {
             let a_state = state.clone();
             Some(std::thread::spawn(move || {
-                if let Err(e) = audio::audio_decode_thread(arx, ap_params, atb, ap, a_state, cfg)
-                {
+                if let Err(e) = audio::audio_decode_thread(arx, ap_params, atb, ap, a_state, cfg) {
                     tracing::warn!(target: "audio", "thread error: {e}");
                 }
             }))
