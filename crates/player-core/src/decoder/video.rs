@@ -156,6 +156,22 @@ fn drain_video(
             return;
         }
 
+        let abs_pts = pts_to_us(vyuv.timestamp().unwrap_or(0), vtb.0, vtb.1)
+            .unwrap_or(0)
+            .max(0) as u64;
+        let first = *first_pts_us.get_or_insert(abs_pts);
+        let ts_us = abs_pts.saturating_sub(first);
+
+        // Drop already-late frames before GPU readback / RGBA conversion.
+        // Still do the actual presentation wait AFTER conversion, so the
+        // conversion cost does not add latency to every healthy frame.
+        let clock = audio.as_ref().and_then(|ap| ap.clock_us());
+        if state.epoch() != epoch
+            || clock.is_some_and(|now| now.saturating_sub(ts_us) > cfg.late_drop_us.max(0) as u64)
+        {
+            continue;
+        }
+
         // If this frame is in HW memory, transfer to system memory before
         // scaling. Compare against the raw AVFrame format field, not
         // ffmpeg-next's Pixel enum — the enum discriminants don't match the
@@ -208,15 +224,7 @@ fn drain_video(
             continue;
         }
 
-        let abs_pts = pts_to_us(vyuv.timestamp().unwrap_or(0), vtb.0, vtb.1)
-            .unwrap_or(0)
-            .max(0) as u64;
-        let first = *first_pts_us.get_or_insert(abs_pts);
-        let ts_us = abs_pts.saturating_sub(first);
-
-        // Pace presentation against audio clock (or wall-clock fallback).
-        // Drop frame if we're far past its display time or a seek superseded
-        // this epoch while we were waiting.
+        // Conversion may have overlapped a seek, shutdown or clock advance.
         if pace_video(audio, wall_anchor, ts_us, state, cfg, epoch) {
             continue;
         }
@@ -288,25 +296,30 @@ fn pace_video(
     cfg: &PlaybackConfig,
     epoch: u64,
 ) -> bool {
+    if state.shutdown() || state.epoch() != epoch {
+        return true;
+    }
     if let Some(ap) = audio.as_ref() {
         if ap.clock_us().is_some() {
             *wall_anchor = None;
-            let wait_start = Instant::now();
+            let mut progress_at = Instant::now();
+            let mut previous_clock = ap.clock_us();
             loop {
                 if state.shutdown() {
-                    return false;
+                    return true;
                 }
                 if state.epoch() != epoch {
                     return true; // seeked away while waiting — drop this frame
                 }
                 while state.paused() {
                     if state.shutdown() {
-                        return false;
+                        return true;
                     }
                     if state.epoch() != epoch {
                         return true;
                     }
                     std::thread::sleep(cfg.pace_slice);
+                    progress_at = Instant::now();
                 }
                 // Clock can go None mid-wait (seek in progress) — fall through
                 // to the epoch check next iteration rather than treating the
@@ -322,8 +335,14 @@ fn pace_video(
                 if diff <= 0 {
                     return -diff > cfg.late_drop_us;
                 }
-                // Safety bail-out in case the audio clock stalls.
-                if wait_start.elapsed() > Duration::from_secs(2) {
+                // An empty ring is network buffering, not a dead device.
+                // Keep video at the same media position until audio resumes.
+                // Only bail out if queued audio actually stops progressing.
+                if previous_clock != Some(now as u64) || ap.queued_samples() == 0 {
+                    previous_clock = Some(now as u64);
+                    progress_at = Instant::now();
+                }
+                if progress_at.elapsed() > Duration::from_secs(2) {
                     tracing::warn!(target: "video", "pace bailout: ts_us={ts_us} clock={now} diff_ms={}", diff / 1000);
                     return false;
                 }

@@ -106,6 +106,7 @@ pub fn audio_decode_thread(
         &mut seed,
     );
     flush_resampler(&mut resampler, &player, &cfg);
+    player.finish();
     Ok(())
 }
 

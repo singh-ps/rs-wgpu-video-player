@@ -18,13 +18,16 @@ use std::{
 pub struct AudioPlayer {
     /// Interleaved f32 samples queued for playback.
     samples: Arc<Mutex<VecDeque<f32>>>,
-    /// Interleaved samples written to the driver. Combined with the device
-    /// output latency this yields the audible playback clock.
+    /// Media sample position: samples written to the driver plus samples
+    /// skipped on overflow. Temporary underrun silence does not advance it.
     samples_consumed: Arc<AtomicU64>,
     /// Device output buffer latency in microseconds (driver-reported).
     output_latency_us: Arc<AtomicU64>,
     /// Set true once the callback has emitted at least one real sample.
     started: Arc<AtomicBool>,
+    /// Decoder reached EOF. Only then may silence advance beyond the last
+    /// audio sample, allowing a longer video track to finish.
+    finished: Arc<AtomicBool>,
     state: Arc<PlaybackState>,
     cfg: PlaybackConfig,
 }
@@ -37,6 +40,7 @@ impl AudioPlayer {
             samples_consumed: Arc::new(AtomicU64::new(0)),
             output_latency_us: Arc::new(AtomicU64::new(0)),
             started: Arc::new(AtomicBool::new(false)),
+            finished: Arc::new(AtomicBool::new(false)),
             state,
             cfg,
         }
@@ -48,7 +52,15 @@ impl AudioPlayer {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        push_with_drop_oldest(&mut buf, data, ring_cap_samples(&self.cfg));
+        let dropped = push_with_drop_oldest(&mut buf, data, ring_cap_samples(&self.cfg));
+        // Dropping media skips forward on the timeline. Without accounting
+        // for this, the clock permanently trails what the speakers play.
+        self.samples_consumed
+            .fetch_add(dropped as u64, Ordering::Relaxed);
+        drop(buf);
+        if dropped > 0 {
+            tracing::warn!(target: "audio", "sample ring overflow: skipped {dropped} samples");
+        }
     }
 
     /// Interleaved samples currently queued for playback.
@@ -65,13 +77,15 @@ impl AudioPlayer {
     /// against the stale pre-seek position. Called from the demux thread
     /// *before* any post-seek packet is dispatched.
     pub fn begin_seek(&self) {
-        // Suspend first: the cpal callback checks `started` before advancing.
-        self.started.store(false, Ordering::Relaxed);
-        self.samples_consumed.store(0, Ordering::Relaxed);
         let mut buf = match self.samples.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
+        // Serialize the reset with render/push, so an in-flight callback
+        // cannot restore the old clock after it has been reset.
+        self.started.store(false, Ordering::Relaxed);
+        self.finished.store(false, Ordering::Relaxed);
+        self.samples_consumed.store(0, Ordering::Relaxed);
         buf.clear();
     }
 
@@ -86,6 +100,43 @@ impl AudioPlayer {
             .saturating_mul(self.cfg.audio_channels as u64)
             / 1_000_000;
         self.samples_consumed.store(samples, Ordering::Relaxed);
+    }
+
+    pub(crate) fn finish(&self) {
+        self.finished.store(true, Ordering::Release);
+    }
+
+    /// Fill one device buffer without blocking the realtime thread. Keep the
+    /// clock on the media timeline: underrun/lock-contention silence is not
+    /// decoded audio and must not move video ahead of audio when it resumes.
+    fn render(&self, out: &mut [f32]) {
+        out.fill(0.0);
+        if self.state.shutdown() || self.state.paused() {
+            return;
+        }
+        let vol = self.state.volume() as f32 / 100.0;
+        let Ok(mut buf) = self.samples.try_lock() else {
+            return;
+        };
+        let mut real_written = 0;
+        for s in out.iter_mut() {
+            let Some(v) = buf.pop_front() else { break };
+            *s = v * vol;
+            real_written += 1;
+        }
+        if real_written > 0 {
+            self.started.store(true, Ordering::Relaxed);
+        }
+        let advanced = if self.finished.load(Ordering::Acquire) && buf.is_empty() {
+            // End of audio is different from temporary network starvation.
+            out.len()
+        } else {
+            real_written
+        };
+        if self.started.load(Ordering::Relaxed) {
+            self.samples_consumed
+                .fetch_add(advanced as u64, Ordering::Relaxed);
+        }
     }
 
     /// Master clock: microseconds of audio audible at the speakers right now.
@@ -116,11 +167,8 @@ impl AudioPlayer {
             buffer_size: cpal::BufferSize::Default,
         };
 
-        let samples = self.samples.clone();
-        let consumed = self.samples_consumed.clone();
         let latency_us = self.output_latency_us.clone();
-        let started = self.started.clone();
-        let state = self.state.clone();
+        let player = self.clone();
         let max_latency_us = self.cfg.max_audio_latency_us;
 
         let stream = device
@@ -134,47 +182,7 @@ impl AudioPlayer {
                         let raw = d.as_micros() as u64;
                         latency_us.store(raw.min(max_latency_us), Ordering::Relaxed);
                     }
-                    if state.shutdown() || state.paused() {
-                        // Silence; do NOT advance clock so video pacing pauses too.
-                        for s in out.iter_mut() {
-                            *s = 0.0;
-                        }
-                        return;
-                    }
-
-                    let vol = (state.volume() as f32 / 100.0).clamp(0.0, 1.0);
-                    let mut real_written = 0usize;
-                    match samples.try_lock() {
-                        Ok(mut buf) => {
-                            for s in out.iter_mut() {
-                                match buf.pop_front() {
-                                    Some(v) => {
-                                        *s = v * vol;
-                                        real_written += 1;
-                                    }
-                                    None => *s = 0.0,
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            // Decoder briefly holds the lock — never block the
-                            // realtime callback; emit silence for this batch.
-                            for s in out.iter_mut() {
-                                *s = 0.0;
-                            }
-                        }
-                    }
-
-                    if real_written > 0 {
-                        started.store(true, Ordering::Relaxed);
-                    }
-                    // Advance the master clock by the full callback length
-                    // *once playback has begun*. Silence on underrun still
-                    // counts as time elapsed; otherwise video stalls whenever
-                    // the audio queue runs dry for an instant.
-                    if started.load(Ordering::Relaxed) {
-                        consumed.fetch_add(out.len() as u64, Ordering::Relaxed);
-                    }
+                    player.render(out);
                 },
                 |err| tracing::warn!(target: "audio", "cpal stream error: {err}"),
                 None,
@@ -190,16 +198,14 @@ pub(crate) fn ring_cap_samples(cfg: &PlaybackConfig) -> usize {
     (cfg.audio_sample_rate as f32 * cfg.audio_channels as f32 * cfg.sample_ring_cap_secs) as usize
 }
 
-/// Push samples into the ring; drop oldest when capacity is exceeded. Pure;
-/// no synchronisation. See tests for the invariant.
-pub(crate) fn push_with_drop_oldest(buf: &mut VecDeque<f32>, data: &[f32], cap: usize) {
-    let total = buf.len() + data.len();
-    if total > cap {
-        let overflow = total - cap;
-        let drop_n = overflow.min(buf.len());
-        buf.drain(..drop_n);
-    }
-    buf.extend(data.iter().copied());
+/// Keep the newest `cap` samples and return the number of skipped samples,
+/// including any discarded prefix of an oversized incoming batch.
+pub(crate) fn push_with_drop_oldest(buf: &mut VecDeque<f32>, data: &[f32], cap: usize) -> usize {
+    let dropped = (buf.len() + data.len()).saturating_sub(cap);
+    let from_queue = dropped.min(buf.len());
+    buf.drain(..from_queue);
+    buf.extend(data[dropped - from_queue..].iter().copied());
+    dropped
 }
 
 /// Audio clock math: convert sample counts and driver latency into the
@@ -218,6 +224,96 @@ pub(crate) fn audio_clock_us(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_player() -> AudioPlayer {
+        AudioPlayer::new(Arc::new(PlaybackState::new()), PlaybackConfig::default())
+    }
+
+    #[test]
+    fn network_starvation_and_recovery_preserve_media_clock() {
+        let player = test_player();
+        let mut out = [0.0; 960]; // 10 ms of stereo PCM
+        player.push(&vec![0.5; 96_000]);
+        for _ in 0..100 {
+            player.render(&mut out);
+        }
+        assert_eq!(player.clock_us(), Some(1_000_000));
+        // Three seconds of network starvation must not make video run three
+        // seconds ahead of the audio that will arrive next.
+        for _ in 0..300 {
+            player.render(&mut out);
+            assert!(out.iter().all(|&s| s == 0.0));
+        }
+        assert_eq!(player.clock_us(), Some(1_000_000));
+        player.push(&vec![0.25; 9_600]);
+        for _ in 0..10 {
+            player.render(&mut out);
+        }
+        assert_eq!(player.clock_us(), Some(1_100_000));
+        assert!(out.iter().all(|&s| s == 0.25));
+    }
+
+    #[test]
+    fn partial_callback_counts_only_real_samples() {
+        let player = test_player();
+        player.push(&[0.5; 480]);
+        let mut out = [1.0; 960];
+        player.render(&mut out);
+        assert_eq!(player.clock_us(), Some(5_000));
+        assert!(out[..480].iter().all(|&s| s == 0.5));
+        assert!(out[480..].iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn callback_lock_contention_does_not_advance_media_clock() {
+        let player = test_player();
+        player.push(&[0.5; 1920]);
+        let mut out = [0.0; 960];
+        player.render(&mut out);
+        let guard = player.samples.lock().unwrap();
+        player.render(&mut out);
+        assert_eq!(player.clock_us(), Some(10_000));
+        assert!(out.iter().all(|&s| s == 0.0));
+        drop(guard);
+        player.render(&mut out);
+        assert_eq!(player.clock_us(), Some(20_000));
+    }
+
+    #[test]
+    fn overflow_clock_matches_samples_that_actually_play() {
+        let cfg = PlaybackConfig {
+            sample_ring_cap_secs: 0.02,
+            ..PlaybackConfig::default()
+        };
+        let player = AudioPlayer::new(Arc::new(PlaybackState::new()), cfg);
+        player.push(&[0.25; 1920]);
+        player.push(&[0.5; 960]); // Drops the oldest 10 ms.
+        assert_eq!(player.queued_samples(), 1920);
+        let mut out = [0.0; 1920];
+        player.render(&mut out);
+        assert_eq!(player.clock_us(), Some(30_000));
+        assert!(out[..960].iter().all(|&s| s == 0.25));
+        assert!(out[960..].iter().all(|&s| s == 0.5));
+    }
+
+    #[test]
+    fn audio_eof_allows_longer_video_track_to_finish() {
+        let player = test_player();
+        player.push(&[0.5; 960]);
+        player.finish();
+        let mut out = [0.0; 960];
+        for _ in 0..3 {
+            player.render(&mut out);
+        }
+        assert_eq!(player.clock_us(), Some(30_000));
+        assert!(out.iter().all(|&s| s == 0.0));
+        player.begin_seek();
+        player.resume_at_us(1_000_000);
+        player.push(&[0.5; 960]);
+        player.render(&mut out);
+        player.render(&mut out);
+        assert_eq!(player.clock_us(), Some(1_010_000));
+    }
 
     #[test]
     fn ring_push_under_capacity_preserves_all() {
@@ -246,11 +342,9 @@ mod tests {
     #[test]
     fn ring_push_data_alone_exceeds_capacity() {
         let mut buf = VecDeque::new();
-        push_with_drop_oldest(&mut buf, &[1.0, 2.0, 3.0, 4.0, 5.0], 3);
-        // overflow = 5, drop_n = min(5, 0) = 0; just appends — exceeds cap.
-        // This is the documented behaviour: drop oldest in *existing buf only*.
-        // (In practice the caller chunks small batches; this case isn't hit.)
-        assert_eq!(buf.len(), 5);
+        let dropped = push_with_drop_oldest(&mut buf, &[1.0, 2.0, 3.0, 4.0, 5.0], 3);
+        assert_eq!(dropped, 2);
+        assert_eq!(buf, VecDeque::from(vec![3.0, 4.0, 5.0]));
     }
 
     #[test]
