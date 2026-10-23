@@ -9,7 +9,7 @@ mod audio_player;
 pub use audio_player::AudioPlayer;
 
 mod config;
-pub use config::PlaybackConfig;
+pub use config::{PixelFormat, PlaybackConfig};
 
 mod decoder;
 use decoder::{loop_decoder, DemuxCommand};

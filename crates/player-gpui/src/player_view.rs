@@ -11,7 +11,7 @@ use gpui_component::{
     theme::ActiveTheme,
     v_flex,
 };
-use player_core::{AudioStream, Frame, PlaybackEvent, VideoPlayer};
+use player_core::{AudioStream, Frame, PixelFormat, PlaybackConfig, PlaybackEvent, VideoPlayer};
 
 fn format_time(us: u64) -> String {
     let total_secs = (us as f64 / 1_000_000.0).round() as u64;
@@ -25,15 +25,16 @@ fn format_time(us: u64) -> String {
     }
 }
 
-/// GPUI's renderer reads `RenderImage` bytes as BGRA; player-core delivers
-/// RGBA, so swizzle while copying. Video frames are opaque, so premultiplied
-/// alpha is a non-issue.
+/// GPUI's renderer reads `RenderImage` bytes as BGRA, so the player is
+/// configured with [`PixelFormat::Bgra`] and the scaler hands us that layout
+/// directly — the buffer below is `RgbaImage` only because that is the
+/// container `RenderImage` is built from; its bytes are B, G, R, A. Video
+/// frames are opaque, so premultiplied alpha is a non-issue.
+///
+/// Still a full-frame copy (`RenderImage` owns its pixels), so call this off
+/// the foreground executor — see the frame listener.
 fn to_render_image(frame: &Frame) -> Arc<RenderImage> {
-    let mut data = frame.data.to_vec();
-    for px in data.as_chunks_mut::<4>().0 {
-        px.swap(0, 2);
-    }
-    let buffer = image::RgbaImage::from_raw(frame.width, frame.height, data)
+    let buffer = image::RgbaImage::from_raw(frame.width, frame.height, frame.data.to_vec())
         .expect("frame data length matches dimensions");
     Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
         buffer
@@ -48,6 +49,8 @@ pub struct PlayerView {
     /// Startup + event/frame pump; dropping the view cancels it.
     _listener: Option<Task<()>>,
     frame: Option<Arc<RenderImage>>,
+    /// A decoded frame landed since the last draw; see `render`.
+    frame_pending: bool,
     duration_us: u64,
     elapsed_us: u64,
     is_playing: bool,
@@ -67,7 +70,12 @@ impl PlayerView {
         let listener = cx.spawn_in(window, async move |this, cx| {
             // Created inside the task rather than in `new` so the cpal stream
             // and decoder only spin up once the window actually exists.
-            let (mut player, audio_stream) = VideoPlayer::new();
+            let (mut player, audio_stream) = VideoPlayer::with_config(PlaybackConfig {
+                // GPUI uploads `RenderImage` bytes as BGRA; have the scaler
+                // emit that directly rather than swizzling every frame here.
+                output_format: PixelFormat::Bgra,
+                ..PlaybackConfig::default()
+            });
             let mut events_rx = match player.start_playback(&url).await {
                 Ok(rx) => rx,
                 Err(e) => {
@@ -132,7 +140,17 @@ impl PlayerView {
                         let Some(frame) = frame_opt else { continue };
                         tracing::debug!(target: "app",
                             "frame received {}x{} ts={}us", frame.width, frame.height, frame.ts_us);
-                        let render = to_render_image(&frame);
+                        // The copy into `RenderImage` is ~4 MB a frame. Run on
+                        // the foreground executor it starves the window's
+                        // paint messages — those are WM_PAINT on Windows, the
+                        // lowest-priority message there is, so a steady drip
+                        // of posted task wake-ups is enough to stop the window
+                        // redrawing entirely and have the OS mark it as not
+                        // responding.
+                        let converting = frame.clone();
+                        let render = cx
+                            .background_spawn(async move { to_render_image(&converting) })
+                            .await;
                         let res = this.update_in(cx, |view, window, cx| {
                             // Every frame is a fresh RenderImage with a new
                             // id; without this the sprite atlas accumulates
@@ -141,6 +159,7 @@ impl PlayerView {
                                 let _ = window.drop_image(prev);
                             }
                             view.frame = Some(render);
+                            view.frame_pending = true;
                             view.elapsed_us = frame.ts_us;
                             if view.duration_us > 0 {
                                 let frac =
@@ -149,8 +168,10 @@ impl PlayerView {
                                     slider.set_value(frac as f32, window, cx);
                                 });
                             }
+                            // `cx.notify()` alone — `window.refresh()` would
+                            // invalidate every view in the window and discard
+                            // cached elements, once per decoded frame.
                             cx.notify();
-                            window.refresh();
                         });
                         if let Err(e) = res {
                             tracing::warn!(target: "app", "frame update failed, stopping listener: {e}");
@@ -166,6 +187,7 @@ impl PlayerView {
             _audio_stream: None,
             _listener: Some(listener),
             frame: None,
+            frame_pending: false,
             duration_us: 0,
             elapsed_us: 0,
             is_playing: false,
@@ -199,14 +221,14 @@ impl Render for PlayerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         tracing::debug!(target: "app",
             "render: frame={} elapsed={}us", self.frame.is_some(), self.elapsed_us);
-        // Drive redraws off the display link while playing. Entity notifies
-        // alone don't sustain draws here: they mark the window dirty, but the
-        // macOS display link only polls that flag while it runs, and nothing
-        // restarts it for a notify. An armed next-frame callback does, so each
-        // render schedules the next one for as long as video is advancing.
-        // `window.refresh()` in the frame listener kick-starts the loop: the
-        // first event-driven draw that sees `is_playing` re-arms it.
-        if self.is_playing {
+        // Re-arm the display link only for a frame that actually arrived.
+        // Entity notifies alone don't sustain draws on macOS — the display
+        // link only polls the dirty flag while it runs — so a decoded frame
+        // schedules one more callback to carry the loop forward. Arming this
+        // on `is_playing` instead pins the window at the refresh rate whether
+        // or not video advanced, which is enough on its own to saturate the
+        // foreground executor and leave the window unresponsive.
+        if std::mem::take(&mut self.frame_pending) {
             window.request_animation_frame();
         }
         let video = match self.frame.clone() {
@@ -232,13 +254,7 @@ impl Render for PlayerView {
         v_flex()
             .size_full()
             .bg(cx.theme().background)
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .bg(gpui::black())
-                    .child(video),
-            )
+            .child(div().flex_1().min_h_0().bg(gpui::black()).child(video))
             .child(
                 h_flex()
                     .gap_3()
