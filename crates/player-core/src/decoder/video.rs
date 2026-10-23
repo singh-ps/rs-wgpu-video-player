@@ -1,6 +1,6 @@
 use crate::{
     audio_player::AudioPlayer,
-    config::PlaybackConfig,
+    config::{PixelFormat, PlaybackConfig},
     decoder::{demux::TaggedPacket, hw::try_enable_hw_decoder, pts_to_us},
     error::{PlayerError, Result},
     frame_buffer::{Frame, FrameBuffer},
@@ -42,7 +42,10 @@ pub fn video_decode_thread(
 
     let out_w = vdec.width();
     let out_h = vdec.height();
-    let out_pix = Pixel::RGBA;
+    let out_pix = match cfg.output_format {
+        PixelFormat::Rgba => Pixel::RGBA,
+        PixelFormat::Bgra => Pixel::BGRA,
+    };
 
     // Scaler is initialised lazily on the first decoded frame: with HW
     // decoding we don't know the post-transfer SW pixel format up front, and
@@ -464,7 +467,9 @@ mod tests {
 
     /// A frozen audio clock with `started` already set: the state the pipeline
     /// lands in when audio stops arriving mid-stream and never resumes.
-    fn stalled_clock(margin_secs: f32) -> (PlaybackConfig, Arc<PlaybackState>, Option<AudioPlayer>) {
+    fn stalled_clock(
+        margin_secs: f32,
+    ) -> (PlaybackConfig, Arc<PlaybackState>, Option<AudioPlayer>) {
         // Zero ring headroom, so the stall timeout is the margin alone.
         let cfg = PlaybackConfig {
             sample_ring_cap_secs: 1.0,

@@ -1,5 +1,18 @@
 use std::time::Duration;
 
+/// Byte order of the four-byte pixels the decoder publishes.
+///
+/// The scaler has to write *some* 32-bit layout, so letting the frontend pick
+/// costs the decode thread nothing and saves the UI a full-frame swizzle per
+/// frame.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PixelFormat {
+    /// `R, G, B, A` — what Slint's `SharedPixelBuffer<Rgba8Pixel>` expects.
+    Rgba,
+    /// `B, G, R, A` — what GPUI's `RenderImage` expects.
+    Bgra,
+}
+
 /// Tunables for the playback pipeline. Defaults match the values that shipped
 /// before this struct existed.
 ///
@@ -32,6 +45,8 @@ pub struct PlaybackConfig {
     pub max_audio_latency_us: u64,
     pub audio_sample_rate: u32,
     pub audio_channels: u16,
+    /// Byte order of the frames pushed to the [`crate::FrameBuffer`].
+    pub output_format: PixelFormat,
 }
 
 impl PlaybackConfig {
@@ -63,14 +78,23 @@ impl Default for PlaybackConfig {
             max_audio_latency_us: 200_000,
             audio_sample_rate: 48_000,
             audio_channels: 2,
+            output_format: PixelFormat::Rgba,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::PlaybackConfig;
+    use super::{PixelFormat, PlaybackConfig};
     use std::time::Duration;
+
+    #[test]
+    fn default_output_is_rgba() {
+        // player-slint takes the default config and hands the bytes straight
+        // to `SharedPixelBuffer<Rgba8Pixel>`, so flipping this default swaps
+        // red and blue in that frontend with nothing to catch it.
+        assert_eq!(PlaybackConfig::default().output_format, PixelFormat::Rgba);
+    }
 
     #[test]
     fn default_stall_timeout_is_five_seconds() {
