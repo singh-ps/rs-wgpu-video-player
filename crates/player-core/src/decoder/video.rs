@@ -335,15 +335,22 @@ fn pace_video(
                 if diff <= 0 {
                     return -diff > cfg.late_drop_us;
                 }
-                // An empty ring is network buffering, not a dead device.
-                // Keep video at the same media position until audio resumes.
-                // Only bail out if queued audio actually stops progressing.
-                if previous_clock != Some(now as u64) || ap.queued_samples() == 0 {
+                // An underrun is network buffering, not a dead device: the
+                // clock freezes rather than racing ahead, so holding this
+                // frame keeps A/V aligned. The wait must stay bounded though
+                // — audio that never resumes (decode error, mid-stream audio
+                // gap) would park this thread for the rest of the session and
+                // freeze the UI. Present the frame instead of hanging; pacing
+                // resyncs on its own once the clock moves again.
+                if previous_clock != Some(now as u64) {
                     previous_clock = Some(now as u64);
                     progress_at = Instant::now();
                 }
-                if progress_at.elapsed() > Duration::from_secs(2) {
-                    tracing::warn!(target: "video", "pace bailout: ts_us={ts_us} clock={now} diff_ms={}", diff / 1000);
+                if progress_at.elapsed() > cfg.audio_stall_timeout() {
+                    tracing::warn!(target: "video",
+                        "pace bailout: ts_us={ts_us} clock={now} diff_ms={} queued={}",
+                        diff / 1000,
+                        ap.queued_samples());
                     return false;
                 }
                 let sleep_us = (diff as u64).min(cfg.pace_slice.as_micros() as u64);
@@ -386,6 +393,43 @@ fn pace_video(
 #[cfg(test)]
 mod tests {
     use super::pack_rows;
+
+    #[test]
+    fn pace_bailout_presents_frame_when_the_audio_clock_dies() {
+        use super::pace_video;
+        use crate::{audio_player::AudioPlayer, config::PlaybackConfig, state::PlaybackState};
+        use std::{
+            sync::Arc,
+            time::{Duration, Instant},
+        };
+
+        // Zero headroom + 50 ms margin → 50 ms stall timeout.
+        let cfg = PlaybackConfig {
+            sample_ring_cap_secs: 1.0,
+            demux_ahead_secs: 1.0,
+            audio_stall_margin_secs: 0.05,
+            ..PlaybackConfig::default()
+        };
+        let state = Arc::new(PlaybackState::new());
+        let player = AudioPlayer::new(state.clone(), cfg);
+        player.push(&[0.0; 960]);
+        let mut out = [0.0; 960];
+        player.render(&mut out); // Starts the clock; the ring is empty again.
+        assert_eq!(player.clock_us(), Some(10_000));
+
+        // Audio never resumes — the frozen clock sits 990 ms behind this
+        // frame. Waiting for it forever would freeze the UI, so the pacer
+        // gives up and presents the frame instead of dropping it.
+        let audio = Some(player);
+        let mut wall_anchor = None;
+        let start = Instant::now();
+        let dropped = pace_video(&audio, &mut wall_anchor, 1_000_000, &state, &cfg, 0);
+        assert!(!dropped, "bailout must present the frame, not drop it");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "pace wait must stay bounded"
+        );
+    }
 
     #[test]
     fn packed_plane_is_copied_verbatim() {

@@ -109,12 +109,14 @@ impl AudioPlayer {
     /// Fill one device buffer without blocking the realtime thread. Keep the
     /// clock on the media timeline: underrun/lock-contention silence is not
     /// decoded audio and must not move video ahead of audio when it resumes.
-    fn render(&self, out: &mut [f32]) {
+    pub(crate) fn render(&self, out: &mut [f32]) {
         out.fill(0.0);
         if self.state.shutdown() || self.state.paused() {
             return;
         }
-        let vol = self.state.volume() as f32 / 100.0;
+        // `set_volume` clamps, but the field is public — never let a stray
+        // value above 100 clip the samples we hand the driver.
+        let vol = (self.state.volume() as f32 / 100.0).clamp(0.0, 1.0);
         let Ok(mut buf) = self.samples.try_lock() else {
             return;
         };

@@ -73,19 +73,9 @@ pub fn loop_decoder(
         _ => (usize::MAX, None, ffmpeg::Rational(0, 1)),
     };
 
-    // Ignoring unwanted packets below is too late: the HLS demuxer downloads
-    // every enabled variant before returning them. Discard unused streams at
-    // the source so only playlists containing our selected pair stay active.
-    for mut stream in ictx.streams_mut() {
-        if stream.index() != vindex && stream.index() != aindex {
-            // SAFETY: stream is a valid mutable AVStream owned by ictx; no
-            // demux/decode threads have been started yet.
-            unsafe {
-                (*stream.as_mut_ptr()).discard = ffmpeg::ffi::AVDiscard::AVDISCARD_ALL;
-            }
-        }
-    }
-    tracing::info!(target: "demux", "selected video stream {vindex}, audio stream {:?}", aparams.as_ref().map(|_| aindex));
+    let keep_audio = aparams.is_some().then_some(aindex);
+    discard_other_streams(&mut ictx, vindex, keep_audio);
+    tracing::info!(target: "demux", "selected video stream {vindex}, audio stream {keep_audio:?}");
 
     // ── Channels: demux → decode threads ─────────────────────────────────────
     let (vtx, vrx) = mpsc::sync_channel::<TaggedPacket>(cfg.video_pkt_queue);
@@ -149,6 +139,28 @@ pub fn loop_decoder(
 
     let _ = events.send(PlaybackEvent::Ended);
     Ok(())
+}
+
+/// Stop the demuxer from fetching anything but the selected video/audio pair.
+/// For HLS this deactivates the other variant playlists, so only the chosen
+/// one keeps downloading segments — ignoring their packets once they arrive is
+/// too late, the bytes are already on the wire.
+///
+/// ffmpeg-next 8.0 exposes `Stream::discard` as a getter only and has no
+/// setter on `StreamMut`, so the field is written through the raw `AVStream`.
+fn discard_other_streams(ictx: &mut format::context::Input, video: usize, audio: Option<usize>) {
+    for mut stream in ictx.streams_mut() {
+        let index = stream.index();
+        if index == video || Some(index) == audio {
+            continue;
+        }
+        // SAFETY: `stream` is a live mutable AVStream owned by `ictx`, and no
+        // demux or decode thread has started yet, so nothing else can read
+        // `discard` concurrently.
+        unsafe {
+            (*stream.as_mut_ptr()).discard = ffmpeg::Discard::All.into();
+        }
+    }
 }
 
 #[inline]
