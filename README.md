@@ -79,14 +79,19 @@ UI controls:
 
 - **Demux thread** pulls packets, dispatches video freely; audio dispatch
   is throttled by sample-ring depth (≥ 3 s pre-buffer pauses demux audio).
+  After probing, unused streams are discarded in FFmpeg so HLS playback
+  does not keep downloading every bitrate variant.
 - **Video decoder** opens HW context before `avcodec_open2`, transfers HW
   frames to system memory with `av_hwframe_transfer_data`, scales to RGBA
   with libswscale, paces against the audio clock, then pushes to the
   `FrameBuffer`.
 - **Audio decoder** resamples to 48 kHz stereo f32 packed, pushes into a
   capped ring with drop-oldest on overflow.
-- **cpal callback** drains the ring, advances `samples_consumed` (the
-  master clock) and tracks driver-reported output latency.
+- **cpal callback** drains the ring and advances the master clock by media
+  samples consumed, with driver-reported output latency subtracted.
+  Temporary underrun silence does not advance the media clock, so video
+  waits for audio during buffering. Overflow skips are included in the
+  clock; after audio EOF, the clock can continue for a longer video track.
 - **UI task** awaits `changed()` on the watch channel, copies the frame
   into a Slint `SharedPixelBuffer`, and triggers `upgrade_in_event_loop`.
 
@@ -126,6 +131,19 @@ ui/
 cargo build           # debug
 cargo build --release # optimized
 ```
+
+## Playback diagnostics
+
+Run the core pipeline with audio output but without the Slint UI:
+
+```bash
+cargo run -p player-core --example playback_probe -- "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8" 60
+```
+
+This reports observed frames per interval, video/audio timestamps, their
+difference in milliseconds, and queued audio samples. A negative difference
+means the latest observed video frame trails the audio clock. It measures
+the core pipeline, not the time a frame actually appears on screen.
 
 ## License
 
