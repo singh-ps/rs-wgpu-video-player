@@ -25,6 +25,18 @@ fn format_time(us: u64) -> String {
     }
 }
 
+/// Speaker glyph for a 0.0–1.0 level, matching the three steps player-slint
+/// shows.
+fn speaker_icon(level: f32) -> &'static str {
+    if level <= 0.0 {
+        "🔇"
+    } else if level < 0.5 {
+        "🔉"
+    } else {
+        "🔊"
+    }
+}
+
 /// GPUI's renderer reads `RenderImage` bytes as BGRA, so the player is
 /// configured with [`PixelFormat::Bgra`] and the scaler hands us that layout
 /// directly — the buffer below is `RgbaImage` only because that is the
@@ -56,6 +68,11 @@ pub struct PlayerView {
     is_playing: bool,
     status: SharedString,
     timeline: Entity<SliderState>,
+    volume: Entity<SliderState>,
+    /// 0.0–1.0, mirroring the volume slider. Kept here so the speaker icon can
+    /// read it without borrowing the slider entity, and so a level set before
+    /// the stream opens can be applied to the player once it exists.
+    volume_level: f32,
 }
 
 impl PlayerView {
@@ -64,6 +81,23 @@ impl PlayerView {
         cx.subscribe(&timeline, |this, _, ev, _cx| {
             let SliderEvent::Change(value) = ev;
             this.seek_to_fraction(value.start());
+        })
+        .detach();
+
+        let volume = cx.new(|_| {
+            SliderState::new()
+                .min(0.0)
+                .max(1.0)
+                .step(0.01)
+                .default_value(1.0)
+        });
+        cx.subscribe(&volume, |this, _, ev, cx| {
+            let SliderEvent::Change(value) = ev;
+            this.set_volume(value.start());
+            // The speaker glyph reads `volume_level`; without this it would
+            // only catch up on the next decoded frame, so it would sit stale
+            // while paused.
+            cx.notify();
         })
         .detach();
 
@@ -91,6 +125,10 @@ impl PlayerView {
 
             if this
                 .update(cx, |view, cx| {
+                    // The slider is live before the stream opens, so carry
+                    // whatever it reads now onto the player rather than
+                    // letting that first move silently do nothing.
+                    player.set_volume((view.volume_level * 100.0).round() as u32);
                     view.player = Some(player);
                     view._audio_stream = audio_stream;
                     view.is_playing = true;
@@ -193,6 +231,8 @@ impl PlayerView {
             is_playing: false,
             status: "Loading…".into(),
             timeline,
+            volume,
+            volume_level: 1.0,
         }
     }
 
@@ -204,6 +244,16 @@ impl PlayerView {
         let target_us = (fraction.clamp(0.0, 1.0) as f64 * self.duration_us as f64) as u64;
         if let Some(player) = &self.player {
             player.seek_to_us(target_us);
+        }
+    }
+
+    /// `level` is 0.0–1.0; player-core takes 0–100.
+    fn set_volume(&mut self, level: f32) {
+        self.volume_level = level.clamp(0.0, 1.0);
+        let vol = (self.volume_level * 100.0).round() as u32;
+        tracing::debug!(target: "app", "volume set to {vol}");
+        if let Some(player) = &self.player {
+            player.set_volume(vol);
         }
     }
 
@@ -272,7 +322,14 @@ impl Render for PlayerView {
                             .flex_1()
                             .child(Slider::new(&self.timeline).disabled(self.duration_us == 0)),
                     )
-                    .child(total_label),
+                    .child(total_label)
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(speaker_icon(self.volume_level))
+                            .child(div().w_24().child(Slider::new(&self.volume))),
+                    ),
             )
     }
 }
