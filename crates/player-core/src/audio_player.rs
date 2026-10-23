@@ -141,6 +141,20 @@ impl AudioPlayer {
         }
     }
 
+    /// Media position in samples: what the clock is built from, before output
+    /// latency is subtracted. Unlike [`Self::clock_us`] this only moves when
+    /// audio is actually consumed, so it — not the clock — is what pacing
+    /// watches to tell a stalled output stream from driver latency jitter.
+    pub fn consumed_samples(&self) -> u64 {
+        self.samples_consumed.load(Ordering::Relaxed)
+    }
+
+    /// Driver-reported output latency, clamped to the configured ceiling.
+    pub(crate) fn set_output_latency_us(&self, raw_us: u64) {
+        self.output_latency_us
+            .store(raw_us.min(self.cfg.max_audio_latency_us), Ordering::Relaxed);
+    }
+
     /// Master clock: microseconds of audio audible at the speakers right now.
     /// Returns `None` before the stream has emitted any real samples.
     pub fn clock_us(&self) -> Option<u64> {
@@ -169,9 +183,7 @@ impl AudioPlayer {
             buffer_size: cpal::BufferSize::Default,
         };
 
-        let latency_us = self.output_latency_us.clone();
         let player = self.clone();
-        let max_latency_us = self.cfg.max_audio_latency_us;
 
         let stream = device
             .build_output_stream(
@@ -181,8 +193,7 @@ impl AudioPlayer {
                     // write now will actually become audible). Drives A/V sync.
                     let ts = info.timestamp();
                     if let Some(d) = ts.playback.duration_since(&ts.callback) {
-                        let raw = d.as_micros() as u64;
-                        latency_us.store(raw.min(max_latency_us), Ordering::Relaxed);
+                        player.set_output_latency_us(d.as_micros() as u64);
                     }
                     player.render(out);
                 },

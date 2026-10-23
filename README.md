@@ -84,7 +84,10 @@ UI controls:
 - **Video decoder** opens HW context before `avcodec_open2`, transfers HW
   frames to system memory with `av_hwframe_transfer_data`, scales to RGBA
   with libswscale, paces against the audio clock, then pushes to the
-  `FrameBuffer`.
+  `FrameBuffer`. Already-late frames are dropped before readback. If the
+  audio clock stops moving for longer than the stall timeout, pacing latches
+  onto wall-clock and stays there until audio resumes — so audio that never
+  comes back cannot hold the picture for the rest of the session.
 - **Audio decoder** resamples to 48 kHz stereo f32 packed, pushes into a
   capped ring with drop-oldest on overflow.
 - **cpal callback** drains the ring and advances the master clock by media

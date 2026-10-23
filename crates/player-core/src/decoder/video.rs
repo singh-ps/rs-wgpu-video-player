@@ -56,8 +56,8 @@ pub fn video_decode_thread(
     // audio sample-clock (also 0-based). NOT reset on seek — the timeline
     // stays continuous so post-seek positions read as true stream positions.
     let mut first_pts_us: Option<u64> = None;
-    // Wall-clock anchor used only as a fallback before audio clock is live.
-    let mut wall_anchor: Option<(Instant, u64)> = None;
+    // Pacing state that outlives a single frame; reset on seek.
+    let mut pace = PaceState::default();
     // Seek epoch of the packets currently being decoded.
     let mut epoch: u64 = 0;
 
@@ -73,14 +73,16 @@ pub fn video_decode_thread(
             // First packet after a seek: discard decoder-internal state so we
             // start clean from the new keyframe.
             vdec.flush();
-            wall_anchor = None;
+            pace = PaceState::default();
             epoch = pkt_epoch;
         }
-        while state.paused() {
+        // Absorbed here as well as inside `pace_video`, so a pause taken
+        // between frames still shifts the wall-clock anchor.
+        if absorb_pause(&state, &cfg, epoch, &mut pace.wall_anchor) {
             if state.shutdown() {
                 return Ok(());
             }
-            std::thread::sleep(Duration::from_millis(20));
+            continue; // seeked while paused — this packet is stale now
         }
 
         if let Err(e) = vdec.send_packet(&packet) {
@@ -93,7 +95,7 @@ pub fn video_decode_thread(
             &mut vyuv,
             &mut vout,
             &mut first_pts_us,
-            &mut wall_anchor,
+            &mut pace,
             vtb,
             &buffer,
             out_pix,
@@ -116,7 +118,7 @@ pub fn video_decode_thread(
         &mut vyuv,
         &mut vout,
         &mut first_pts_us,
-        &mut wall_anchor,
+        &mut pace,
         vtb,
         &buffer,
         out_pix,
@@ -139,7 +141,7 @@ fn drain_video(
     vyuv: &mut Video,
     vout: &mut Video,
     first_pts_us: &mut Option<u64>,
-    wall_anchor: &mut Option<(Instant, u64)>,
+    pace: &mut PaceState,
     vtb: ffmpeg::Rational,
     buffer: &FrameBuffer,
     out_pix: Pixel,
@@ -225,7 +227,7 @@ fn drain_video(
         }
 
         // Conversion may have overlapped a seek, shutdown or clock advance.
-        if pace_video(audio, wall_anchor, ts_us, state, cfg, epoch) {
+        if pace_video(audio, pace, ts_us, state, cfg, epoch) {
             continue;
         }
 
@@ -283,6 +285,49 @@ fn pack_rows(plane: &[u8], stride: usize, row_bytes: usize, height: usize) -> Op
     Some(packed)
 }
 
+/// Pacing state owned by the video decode thread. Both fields have to outlive
+/// a single frame, and both are discarded on seek.
+#[derive(Default)]
+struct PaceState {
+    /// Anchor for wall-clock pacing, used while no audio clock is live.
+    wall_anchor: Option<(Instant, u64)>,
+    /// Consumed-sample position the audio clock gave up waiting on. While this
+    /// is set, frames are paced on wall-clock instead. Sample position, not
+    /// `clock_us`: the clock also moves when the driver revises its reported
+    /// output latency, which would clear the latch without a single new
+    /// sample having played.
+    audio_stalled_at: Option<u64>,
+}
+
+/// Block while playback is paused, then shift `anchor` forward by the paused
+/// duration: wall-clock pacing measures elapsed real time, so counting a pause
+/// as playback would make every later frame look late enough to drop. Returns
+/// `true` if the caller should give up on the frame (shutdown, or a seek moved
+/// the epoch on while we waited).
+fn absorb_pause(
+    state: &Arc<PlaybackState>,
+    cfg: &PlaybackConfig,
+    epoch: u64,
+    anchor: &mut Option<(Instant, u64)>,
+) -> bool {
+    if !state.paused() {
+        return false;
+    }
+    let paused_at = Instant::now();
+    let mut abort = false;
+    while state.paused() {
+        if state.shutdown() || state.epoch() != epoch {
+            abort = true;
+            break;
+        }
+        std::thread::sleep(cfg.pace_slice);
+    }
+    if let Some((start, _)) = anchor.as_mut() {
+        *start += paused_at.elapsed();
+    }
+    abort
+}
+
 /// Block until the frame's presentation time arrives, paced by the audio
 /// master clock when available, falling back to wall-clock relative to the
 /// first frame. Returns `true` if the frame should be dropped — because it's
@@ -290,7 +335,7 @@ fn pack_rows(plane: &[u8], stride: usize, row_bytes: usize, height: usize) -> Op
 /// we were waiting.
 fn pace_video(
     audio: &Option<AudioPlayer>,
-    wall_anchor: &mut Option<(Instant, u64)>,
+    pace: &mut PaceState,
     ts_us: u64,
     state: &Arc<PlaybackState>,
     cfg: &PlaybackConfig,
@@ -300,10 +345,18 @@ fn pace_video(
         return true;
     }
     if let Some(ap) = audio.as_ref() {
-        if ap.clock_us().is_some() {
-            *wall_anchor = None;
+        // Never wait on a clock already declared stalled. The timeout below
+        // is per-call, so re-arming it for every frame would creep playback
+        // forward one frame per timeout. Pace on wall-clock until audio is
+        // consumed again — the first resumed sample hands pacing straight
+        // back to the clock.
+        let consumed = ap.consumed_samples();
+        let still_stalled = pace.audio_stalled_at == Some(consumed);
+        if ap.clock_us().is_some() && !still_stalled {
+            pace.audio_stalled_at = None;
+            pace.wall_anchor = None;
             let mut progress_at = Instant::now();
-            let mut previous_clock = ap.clock_us();
+            let mut previous_consumed = consumed;
             loop {
                 if state.shutdown() {
                     return true;
@@ -311,14 +364,12 @@ fn pace_video(
                 if state.epoch() != epoch {
                     return true; // seeked away while waiting — drop this frame
                 }
-                while state.paused() {
-                    if state.shutdown() {
+                if state.paused() {
+                    if absorb_pause(state, cfg, epoch, &mut pace.wall_anchor) {
                         return true;
                     }
-                    if state.epoch() != epoch {
-                        return true;
-                    }
-                    std::thread::sleep(cfg.pace_slice);
+                    // A pause is not a stall: it must not count toward the
+                    // timeout, and the clock does not move while paused.
                     progress_at = Instant::now();
                 }
                 // Clock can go None mid-wait (seek in progress) — fall through
@@ -339,18 +390,26 @@ fn pace_video(
                 // clock freezes rather than racing ahead, so holding this
                 // frame keeps A/V aligned. The wait must stay bounded though
                 // — audio that never resumes (decode error, mid-stream audio
-                // gap) would park this thread for the rest of the session and
-                // freeze the UI. Present the frame instead of hanging; pacing
-                // resyncs on its own once the clock moves again.
-                if previous_clock != Some(now as u64) {
-                    previous_clock = Some(now as u64);
+                // gap) would otherwise hold the picture for the rest of the
+                // session. Latch the stall and let wall-clock take over.
+                //
+                // Progress means consumed samples, not `clock_us`: the clock
+                // also shifts when the driver revises its reported latency,
+                // and treating that as progress would re-arm the timeout
+                // forever on a dead output stream.
+                let consumed = ap.consumed_samples();
+                if previous_consumed != consumed {
+                    previous_consumed = consumed;
                     progress_at = Instant::now();
                 }
                 if progress_at.elapsed() > cfg.audio_stall_timeout() {
                     tracing::warn!(target: "video",
-                        "pace bailout: ts_us={ts_us} clock={now} diff_ms={} queued={}",
+                        "audio stalled for {:?} at sample {consumed}, pacing on \
+                         wall-clock: ts_us={ts_us} clock={now} diff_ms={} queued={}",
+                        cfg.audio_stall_timeout(),
                         diff / 1000,
                         ap.queued_samples());
+                    pace.audio_stalled_at = Some(consumed);
                     return false;
                 }
                 let sleep_us = (diff as u64).min(cfg.pace_slice.as_micros() as u64);
@@ -359,26 +418,34 @@ fn pace_video(
         }
     }
 
-    // Wall-clock fallback (no audio configured yet, or audio not started).
-    let now = Instant::now();
-    let (start_inst, first_pts) = match *wall_anchor {
+    // Wall-clock fallback: no audio configured, audio not started yet, or an
+    // audio clock that stopped moving for longer than the stall timeout.
+    if absorb_pause(state, cfg, epoch, &mut pace.wall_anchor) {
+        return true;
+    }
+    let (start_inst, first_pts) = match pace.wall_anchor {
         Some(a) => a,
         None => {
-            *wall_anchor = Some((now, ts_us));
+            pace.wall_anchor = Some((Instant::now(), ts_us));
             return false;
         }
     };
-    let elapsed = now.duration_since(start_inst);
     let target = Duration::from_micros(ts_us.saturating_sub(first_pts));
+    let elapsed = start_inst.elapsed();
     if target > elapsed {
-        let sleep = (target - elapsed).min(cfg.pace_slice);
-        std::thread::sleep(sleep);
-        // Loop until target reached or shutdown — keep responsive.
-        while !state.shutdown() {
-            if state.epoch() != epoch {
+        // Loop until the target arrives — staying responsive to pause, seek
+        // and shutdown rather than sleeping the whole span in one go.
+        loop {
+            if state.shutdown() || state.epoch() != epoch {
                 return true;
             }
-            let elapsed = Instant::now().duration_since(start_inst);
+            if absorb_pause(state, cfg, epoch, &mut pace.wall_anchor) {
+                return true;
+            }
+            // `absorb_pause` moves the anchor, so re-read it every pass
+            // instead of pacing against a pre-pause instant.
+            let start_inst = pace.wall_anchor.map_or(start_inst, |(s, _)| s);
+            let elapsed = start_inst.elapsed();
             if elapsed >= target {
                 break;
             }
@@ -392,42 +459,144 @@ fn pace_video(
 
 #[cfg(test)]
 mod tests {
-    use super::pack_rows;
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
-    #[test]
-    fn pace_bailout_presents_frame_when_the_audio_clock_dies() {
-        use super::pace_video;
-        use crate::{audio_player::AudioPlayer, config::PlaybackConfig, state::PlaybackState};
-        use std::{
-            sync::Arc,
-            time::{Duration, Instant},
-        };
-
-        // Zero headroom + 50 ms margin → 50 ms stall timeout.
+    /// A frozen audio clock with `started` already set: the state the pipeline
+    /// lands in when audio stops arriving mid-stream and never resumes.
+    fn stalled_clock(margin_secs: f32) -> (PlaybackConfig, Arc<PlaybackState>, Option<AudioPlayer>) {
+        // Zero ring headroom, so the stall timeout is the margin alone.
         let cfg = PlaybackConfig {
             sample_ring_cap_secs: 1.0,
             demux_ahead_secs: 1.0,
-            audio_stall_margin_secs: 0.05,
+            audio_stall_margin_secs: margin_secs,
             ..PlaybackConfig::default()
         };
         let state = Arc::new(PlaybackState::new());
         let player = AudioPlayer::new(state.clone(), cfg);
-        player.push(&[0.0; 960]);
-        let mut out = [0.0; 960];
-        player.render(&mut out); // Starts the clock; the ring is empty again.
+        player.push(&[0.0f32; 960]);
+        player.render(&mut [0.0f32; 960]); // Starts the clock; ring empty again.
         assert_eq!(player.clock_us(), Some(10_000));
+        (cfg, state, Some(player))
+    }
 
-        // Audio never resumes — the frozen clock sits 990 ms behind this
-        // frame. Waiting for it forever would freeze the UI, so the pacer
-        // gives up and presents the frame instead of dropping it.
-        let audio = Some(player);
-        let mut wall_anchor = None;
+    #[test]
+    fn pace_bailout_presents_frame_when_the_audio_clock_dies() {
+        let (cfg, state, audio) = stalled_clock(0.05);
+        let mut pace = PaceState::default();
+
+        // The frozen clock sits 990 ms behind this frame. Waiting on it
+        // forever would hold the picture for the rest of the session, so the
+        // pacer gives up and presents the frame instead of dropping it.
         let start = Instant::now();
-        let dropped = pace_video(&audio, &mut wall_anchor, 1_000_000, &state, &cfg, 0);
+        let dropped = pace_video(&audio, &mut pace, 1_000_000, &state, &cfg, 0);
         assert!(!dropped, "bailout must present the frame, not drop it");
         assert!(
             start.elapsed() < Duration::from_secs(1),
             "pace wait must stay bounded"
+        );
+    }
+
+    #[test]
+    fn audio_stall_is_latched_instead_of_re_armed_per_frame() {
+        let (cfg, state, audio) = stalled_clock(0.3);
+        let timeout = cfg.audio_stall_timeout();
+        let mut pace = PaceState::default();
+
+        // The stall costs the timeout exactly once.
+        let start = Instant::now();
+        assert!(!pace_video(&audio, &mut pace, 1_000_000, &state, &cfg, 0));
+        assert!(start.elapsed() >= timeout);
+        assert_eq!(pace.audio_stalled_at, Some(960));
+
+        // The clock is still frozen. Every later frame must pace on
+        // wall-clock, not wait out the timeout again — otherwise playback
+        // creeps forward one frame per timeout instead of stalling or playing.
+        for ts_us in [1_040_000u64, 1_080_000, 1_120_000] {
+            let start = Instant::now();
+            assert!(!pace_video(&audio, &mut pace, ts_us, &state, &cfg, 0));
+            let waited = start.elapsed();
+            assert!(
+                waited < timeout,
+                "frame at {ts_us} waited {waited:?}, stall timeout was re-armed"
+            );
+        }
+
+        // One resumed sample hands pacing back to the audio clock.
+        if let Some(ap) = audio.as_ref() {
+            ap.push(&[0.0f32; 960]);
+            ap.render(&mut [0.0f32; 960]);
+        }
+        assert!(!pace_video(&audio, &mut pace, 0, &state, &cfg, 0));
+        assert_eq!(pace.audio_stalled_at, None);
+    }
+
+    #[test]
+    fn latency_jitter_is_not_audio_progress() {
+        let (cfg, state, audio) = stalled_clock(0.3);
+        let timeout = cfg.audio_stall_timeout();
+        let mut pace = PaceState::default();
+
+        // The driver revises its reported latency while we wait. That moves
+        // `clock_us` without a single sample being consumed; counting it as
+        // progress would keep the timeout re-armed forever.
+        let jitter = Arc::new(AtomicBool::new(true));
+        let shaker = {
+            let (ap, jitter) = (audio.clone().unwrap(), jitter.clone());
+            std::thread::spawn(move || {
+                let mut us = 0;
+                while jitter.load(AtomicOrdering::Relaxed) {
+                    us = if us == 0 { 5_000 } else { 0 };
+                    ap.set_output_latency_us(us);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+
+        let start = Instant::now();
+        assert!(!pace_video(&audio, &mut pace, 1_000_000, &state, &cfg, 0));
+        let waited = start.elapsed();
+        jitter.store(false, AtomicOrdering::Relaxed);
+        shaker.join().unwrap();
+
+        assert!(
+            waited < timeout * 3,
+            "latency jitter kept the stall timeout alive for {waited:?}"
+        );
+        assert_eq!(pace.audio_stalled_at, Some(960));
+    }
+
+    #[test]
+    fn wall_clock_fallback_excludes_paused_time() {
+        let cfg = PlaybackConfig::default();
+        let state = Arc::new(PlaybackState::new());
+        let audio = None; // No audio at all: straight to the wall-clock path.
+        let mut pace = PaceState::default();
+
+        // First frame anchors the wall clock.
+        assert!(!pace_video(&audio, &mut pace, 0, &state, &cfg, 0));
+
+        // Pause for three times `late_drop_us`, unpausing from another thread.
+        // The frame must not be presented before the resume, and the paused
+        // time must not count against its display time — otherwise everything
+        // after a pause looks late enough to drop.
+        assert!(state.toggle_pause());
+        let resumer = {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                assert!(!state.toggle_pause());
+            })
+        };
+        let start = Instant::now();
+        let dropped = pace_video(&audio, &mut pace, 50_000, &state, &cfg, 0);
+        let waited = start.elapsed();
+        resumer.join().unwrap();
+
+        assert!(!dropped, "paused time was counted as playback time");
+        assert!(
+            waited >= Duration::from_millis(300),
+            "frame presented while paused after {waited:?}"
         );
     }
 
