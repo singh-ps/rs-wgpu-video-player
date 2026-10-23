@@ -60,7 +60,11 @@ pub fn loop_decoder(
         (vstream.index(), vstream.parameters(), vstream.time_base())
     };
 
-    let (aindex, aparams, atb) = match (audio.as_ref(), ictx.streams().best(Type::Audio)) {
+    // Prefer audio from the selected video's program (HLS variant).
+    let audio_stream = ictx
+        .stream(vindex)
+        .and_then(|video| ictx.streams().related(&video).best(Type::Audio));
+    let (aindex, aparams, atb) = match (audio.as_ref(), audio_stream) {
         (Some(_), Some(s)) => (s.index(), Some(s.parameters()), s.time_base()),
         (Some(_), None) => {
             tracing::info!(target: "decoder", "no audio stream in source — audio disabled");
@@ -68,6 +72,20 @@ pub fn loop_decoder(
         }
         _ => (usize::MAX, None, ffmpeg::Rational(0, 1)),
     };
+
+    // Ignoring unwanted packets below is too late: the HLS demuxer downloads
+    // every enabled variant before returning them. Discard unused streams at
+    // the source so only playlists containing our selected pair stay active.
+    for mut stream in ictx.streams_mut() {
+        if stream.index() != vindex && stream.index() != aindex {
+            // SAFETY: stream is a valid mutable AVStream owned by ictx; no
+            // demux/decode threads have been started yet.
+            unsafe {
+                (*stream.as_mut_ptr()).discard = ffmpeg::ffi::AVDiscard::AVDISCARD_ALL;
+            }
+        }
+    }
+    tracing::info!(target: "demux", "selected video stream {vindex}, audio stream {:?}", aparams.as_ref().map(|_| aindex));
 
     // ── Channels: demux → decode threads ─────────────────────────────────────
     let (vtx, vrx) = mpsc::sync_channel::<TaggedPacket>(cfg.video_pkt_queue);
